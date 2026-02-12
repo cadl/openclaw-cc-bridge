@@ -1,0 +1,30 @@
+{
+  "name": "openclaw-cc-bridge",
+  "version": "0.0.1",
+  "description": "OpenClaw plugin for controlling Claude Code via chat platforms",
+  "main": "dist/plugin/index.js",
+  "types": "dist/plugin/index.d.ts",
+  "files": [
+    "dist",
+    "skills",
+    "openclaw.plugin.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "debug": "tsc && node dist/debug/debug-server.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/plugin/index.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}

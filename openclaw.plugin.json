@@ -1,0 +1,7 @@
+{
+  "id": "openclaw-cc-bridge",
+  "name": "Claude Code Bridge",
+  "description": "Control Claude Code from chat platforms via OpenClaw",
+  "version": "0.1.0",
+  "skills": ["skills/claude-code"]
+}
