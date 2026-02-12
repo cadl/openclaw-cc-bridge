@@ -52,7 +52,6 @@ npm run debug    # build + run debug server
 
 ## Environment Variables
 
-- `OPENCLAW_CC_WORKSPACE` — Default working directory (default: `cwd()`)
 - `OPENCLAW_CC_DATA_DIR` — Data persistence directory (default: `~/.openclaw/openclaw-cc-bridge`)
 - `OPENCLAW_CC_HOOK_PORT` — Hook server port (default: `19960`)
 - `DEBUG_PORT` — Debug UI port (default: `3456`)

@@ -41,7 +41,6 @@ interface CommandContext {
   authorized: boolean;
 }
 
-const DEFAULT_WORKSPACE = process.env.OPENCLAW_CC_WORKSPACE || process.cwd();
 const DATA_DIR =
   process.env.OPENCLAW_CC_DATA_DIR ||
   join(process.env.HOME || "~", ".openclaw", "openclaw-cc-bridge");
@@ -52,8 +51,8 @@ const DATA_DIR =
  */
 function parseWorkspaceArg(
   args: string,
-  activeWorkspace: string
-): { workspace: string; rest: string } {
+  activeWorkspace: string | undefined
+): { workspace: string | undefined; rest: string } {
   const match = args.match(/(?:^|\s)(?:-w|--workspace)\s+(\S+)/);
   if (match) {
     const workspace = resolve(match[1]);
@@ -67,8 +66,6 @@ function parseWorkspaceArg(
  * OpenClaw plugin registration entry point.
  */
 export default function register(api: PluginApi) {
-  const defaultWorkspace =
-    (api.config.workspace as string) || DEFAULT_WORKSPACE;
   const allowedTools =
     (api.config.allowedTools as string[] | undefined) ?? undefined;
 
@@ -88,11 +85,6 @@ export default function register(api: PluginApi) {
 
   /** Track which workspaces already have hook configs written. */
   const configuredWorkspaces = new Set<string>();
-
-  /** Resolve the active working directory for a sender. */
-  function getActiveWorkspace(senderId: string): string {
-    return sessions.getActiveWorkspace(senderId) || defaultWorkspace;
-  }
 
   /** Ensure hook config exists in the workspace's .claude directory. */
   function ensureHookConfig(workspace: string): void {
@@ -126,7 +118,7 @@ export default function register(api: PluginApi) {
     handler: async (ctx) => {
       const { workspace, rest: prompt } = parseWorkspaceArg(
         ctx.args.trim(),
-        getActiveWorkspace(ctx.senderId)
+        sessions.getActiveWorkspace(ctx.senderId)
       );
 
       if (!prompt) {
@@ -144,6 +136,10 @@ export default function register(api: PluginApi) {
             "  /cc-status            — show all session info",
           ].join("\n"),
         };
+      }
+
+      if (!workspace) {
+        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc -w <path> <message>." };
       }
 
       if (!existsSync(workspace)) {
@@ -207,7 +203,7 @@ export default function register(api: PluginApi) {
     handler: async (ctx) => {
       const { workspace, rest: prompt } = parseWorkspaceArg(
         ctx.args.trim(),
-        getActiveWorkspace(ctx.senderId)
+        sessions.getActiveWorkspace(ctx.senderId)
       );
 
       if (!prompt) {
@@ -223,6 +219,10 @@ export default function register(api: PluginApi) {
             "  /cc-reset             — discard the plan",
           ].join("\n"),
         };
+      }
+
+      if (!workspace) {
+        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc-plan -w <path> <message>." };
       }
 
       if (!existsSync(workspace)) {
@@ -285,8 +285,12 @@ export default function register(api: PluginApi) {
     handler: async (ctx) => {
       const { workspace, rest: additionalNotes } = parseWorkspaceArg(
         ctx.args.trim(),
-        getActiveWorkspace(ctx.senderId)
+        sessions.getActiveWorkspace(ctx.senderId)
       );
+
+      if (!workspace) {
+        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc-execute -w <path>." };
+      }
 
       if (!sessions.hasPendingPlan(ctx.senderId, workspace)) {
         return {
@@ -347,10 +351,10 @@ export default function register(api: PluginApi) {
 
       // No argument: show active workspace and all workspace sessions
       if (!rawPath) {
-        const activeWs = getActiveWorkspace(ctx.senderId);
+        const activeWs = sessions.getActiveWorkspace(ctx.senderId);
         const allSessions = sessions.listSessions(ctx.senderId);
 
-        const lines = [`Active workspace: ${activeWs}`];
+        const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace."];
 
         if (allSessions.length > 0) {
           lines.push("", "All workspace sessions:");
@@ -374,7 +378,7 @@ export default function register(api: PluginApi) {
         return { text: `Directory does not exist: ${absPath}` };
       }
 
-      const previousActive = getActiveWorkspace(ctx.senderId);
+      const previousActive = sessions.getActiveWorkspace(ctx.senderId);
       sessions.setActiveWorkspace(ctx.senderId, absPath);
 
       // Ensure hook config exists in the new workspace
@@ -428,7 +432,10 @@ export default function register(api: PluginApi) {
 
       // No args: reset active workspace session
       if (!args) {
-        const activeWs = getActiveWorkspace(ctx.senderId);
+        const activeWs = sessions.getActiveWorkspace(ctx.senderId);
+        if (!activeWs) {
+          return { text: "No active workspace. Use /cc-reset -w <path> to reset a specific workspace." };
+        }
         const removed = sessions.removeSession(ctx.senderId, activeWs);
         return {
           text: removed
@@ -455,7 +462,7 @@ export default function register(api: PluginApi) {
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
-      const activeWs = getActiveWorkspace(ctx.senderId);
+      const activeWs = sessions.getActiveWorkspace(ctx.senderId);
       const { workspace: filterWs, rest } = parseWorkspaceArg(
         ctx.args.trim(),
         ""
@@ -488,11 +495,11 @@ export default function register(api: PluginApi) {
 
       if (allSessions.length === 0) {
         return {
-          text: `No active sessions.\nDefault workspace: ${defaultWorkspace}`,
+          text: "No active sessions.\nUse /cc-workspace <path> to set a workspace.",
         };
       }
 
-      const lines = [`Active workspace: ${activeWs}`, ""];
+      const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace.", ""];
 
       for (const ws of allSessions) {
         const active = ws.workspace === activeWs ? " (active)" : "";
@@ -513,7 +520,5 @@ export default function register(api: PluginApi) {
     },
   });
 
-  api.logger.info(
-    `[openclaw-cc-bridge] Plugin registered (default workspace: ${defaultWorkspace})`
-  );
+  api.logger.info("[openclaw-cc-bridge] Plugin registered");
 }

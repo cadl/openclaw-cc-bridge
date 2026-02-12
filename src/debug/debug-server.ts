@@ -34,8 +34,7 @@ async function main() {
 
   // Write hook config into the project's .claude directory so it only
   // affects Claude Code sessions running inside this workspace.
-  const workspace = process.env.OPENCLAW_CC_WORKSPACE || process.cwd();
-  const hookConfigPath = join(workspace, ".claude", "settings.local.json");
+  const hookConfigPath = join(process.cwd(), ".claude", "settings.local.json");
   hookServer.generateHookConfig(hookConfigPath);
   console.log(`Hook config written to ${hookConfigPath}`);
 

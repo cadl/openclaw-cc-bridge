@@ -16,7 +16,7 @@ export interface WorkspaceSession {
 
 /** Per-sender state containing an active workspace and all workspace sessions. */
 interface SenderState {
-  activeWorkspace: string;
+  activeWorkspace?: string;
   /** Normalized absolute path → WorkspaceSession */
   workspaceSessions: Record<string, WorkspaceSession>;
 }
@@ -54,7 +54,7 @@ export class SessionManager {
 
   /** Set the active workspace for a sender (does not affect any session). */
   setActiveWorkspace(senderId: string, workspace: string): void {
-    const state = this.ensureSenderState(senderId, workspace);
+    const state = this.ensureSenderState(senderId);
     state.activeWorkspace = workspace;
     this.save();
   }
@@ -68,7 +68,7 @@ export class SessionManager {
 
   /** Update or create a workspace session after a Claude invocation. */
   updateSession(senderId: string, workspace: string, claudeSessionId: string): void {
-    const state = this.ensureSenderState(senderId, workspace);
+    const state = this.ensureSenderState(senderId);
     const existing = state.workspaceSessions[workspace];
     state.workspaceSessions[workspace] = {
       claudeSessionId,
@@ -92,6 +92,8 @@ export class SessionManager {
       if (remaining.length > 0) {
         remaining.sort((a, b) => b.lastActive - a.lastActive);
         state.activeWorkspace = remaining[0].workspace;
+      } else {
+        state.activeWorkspace = undefined;
       }
     }
 
@@ -185,10 +187,10 @@ export class SessionManager {
 
   // ── Internal helpers ────────────────────────────────────────────────
 
-  private ensureSenderState(senderId: string, defaultWorkspace: string): SenderState {
+  private ensureSenderState(senderId: string): SenderState {
     let state = this.senderStates.get(senderId);
     if (!state) {
-      state = { activeWorkspace: defaultWorkspace, workspaceSessions: {} };
+      state = { workspaceSessions: {} };
       this.senderStates.set(senderId, state);
     }
     return state;
