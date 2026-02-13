@@ -49,6 +49,8 @@ export interface ClaudeBridgeOptions {
   allowedTools?: string[];
   /** Additional CLI flags */
   extraArgs?: string[];
+  /** Extra environment variables injected into the Claude Code process */
+  env?: Record<string, string>;
   /** Maximum number of automatic retries on timeout (default: 0 = no retry) */
   maxTimeoutRetries?: number;
   /** Prompt to send when resuming after a timeout (default: "Continue.") */
@@ -75,6 +77,7 @@ export class ClaudeBridge {
   private timeout: number;
   private allowedTools: string[];
   private extraArgs: string[];
+  private extraEnv: Record<string, string>;
   private maxTimeoutRetries: number;
   private timeoutResumePrompt: string;
   private onTimeoutRetry?: (attempt: number, maxRetries: number, sessionId: string) => void;
@@ -83,9 +86,22 @@ export class ClaudeBridge {
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.allowedTools = options.allowedTools ?? DEFAULT_TOOLS;
     this.extraArgs = options.extraArgs ?? [];
+    this.extraEnv = options.env ?? {};
     this.maxTimeoutRetries = options.maxTimeoutRetries ?? 0;
     this.timeoutResumePrompt = options.timeoutResumePrompt ?? "Continue.";
     this.onTimeoutRetry = options.onTimeoutRetry;
+  }
+
+  /** Strip ANTHROPIC_* / CLAUDE_* from process.env so the OpenClaw
+   *  gateway's own API config doesn't leak into the spawned Claude CLI. */
+  private static cleanProcessEnv(): Record<string, string> {
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value === undefined) continue;
+      if (key.startsWith("ANTHROPIC_") || key.startsWith("CLAUDE_")) continue;
+      result[key] = value;
+    }
+    return result;
   }
 
   /**
@@ -175,13 +191,15 @@ export class ClaudeBridge {
     callbacks?: StreamCallbacks
   ): Promise<ClaudeResponse> {
     return new Promise((resolve, reject) => {
+      const childEnv = {
+        ...ClaudeBridge.cleanProcessEnv(),
+        ...this.extraEnv,
+      };
+
       const child = spawn(cmd, args, {
         cwd,
-        env: {
-          ...process.env,
-          CLAUDE_CODE_ENTRYPOINT: "openclaw-cc-bridge",
-        },
-        stdio: ["pipe", "pipe", "pipe"],
+        env: childEnv,
+        stdio: ["inherit", "pipe", "pipe"],
       });
 
       const toolUses: ToolUseEvent[] = [];
@@ -232,6 +250,10 @@ export class ClaudeBridge {
         clearTimeout(timer);
         rl.close();
 
+        if (stderr) {
+          console.error(`[openclaw-cc-bridge] stderr (code=${code}): ${stderr.slice(0, 1000)}`);
+        }
+
         if (!resultEvent) {
           const stderrMsg = stderr ? `\nstderr: ${stderr.slice(0, 500)}` : "";
           reject(
@@ -261,8 +283,7 @@ export class ClaudeBridge {
         reject(new Error(`Failed to spawn claude: ${err.message}`));
       });
 
-      // Close stdin immediately (no interactive input)
-      child.stdin.end();
+      // stdin is inherited (not a pipe), no need to close it
     });
   }
 

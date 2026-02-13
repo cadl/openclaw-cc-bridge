@@ -3,7 +3,7 @@
   "name": "Claude Code Bridge",
   "description": "Control Claude Code from chat platforms via OpenClaw",
   "version": "0.1.0",
-  "skills": ["skills/claude-code"],
+  "skills": ["skills/cc-bridge"],
   "configSchema": {
     "type": "object",
     "properties": {
@@ -11,6 +11,11 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "List of Claude Code tool names to allow (e.g. [\"Bash\", \"Read\", \"Write\"]). If omitted, uses Claude Code defaults."
+      },
+      "env": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Extra environment variables passed to the Claude Code process (e.g. {\"ANTHROPIC_BASE_URL\": \"https://...\", \"ANTHROPIC_AUTH_TOKEN\": \"sk-...\"})"
       }
     },
     "additionalProperties": false

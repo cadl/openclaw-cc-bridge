@@ -10,6 +10,10 @@ import { RunManager } from "../core/run-manager";
  * OpenClaw plugin API types.
  * These are inferred from OpenClaw docs - adjust if the actual API differs.
  */
+interface ToolResult {
+  content: Array<{ type: string; text: string }>;
+}
+
 interface PluginApi {
   registerCommand(opts: {
     name: string;
@@ -18,6 +22,16 @@ interface PluginApi {
     requireAuth?: boolean;
     handler: (ctx: CommandContext) => Promise<{ text: string }>;
   }): void;
+
+  registerTool(
+    opts: {
+      name: string;
+      description: string;
+      parameters: Record<string, unknown>;
+      execute: (id: string, params: Record<string, unknown>) => Promise<ToolResult>;
+    },
+    options?: { optional?: boolean },
+  ): void;
 
   registerService(opts: {
     id: string;
@@ -31,7 +45,7 @@ interface PluginApi {
     debug(msg: string): void;
   };
 
-  config: Record<string, unknown>;
+  pluginConfig: Record<string, unknown>;
 }
 
 interface CommandContext {
@@ -44,6 +58,8 @@ interface CommandContext {
 const DATA_DIR =
   process.env.OPENCLAW_CC_DATA_DIR ||
   join(process.env.HOME || "~", ".openclaw", "openclaw-cc-bridge");
+
+const AGENT_SENDER_ID = "agent";
 
 /**
  * Parse -w / --workspace flag from command args.
@@ -62,15 +78,30 @@ function parseWorkspaceArg(
   return { workspace: activeWorkspace, rest: args };
 }
 
+/** Helper: wrap text in a ToolResult. */
+function textResult(text: string): ToolResult {
+  return { content: [{ type: "text", text }] };
+}
+
 /**
  * OpenClaw plugin registration entry point.
  */
 export default function register(api: PluginApi) {
+  const pluginConfig = api.pluginConfig ?? {};
+
   const allowedTools =
-    (api.config.allowedTools as string[] | undefined) ?? undefined;
+    (pluginConfig.allowedTools as string[] | undefined) ?? undefined;
+  const env =
+    (pluginConfig.env as Record<string, string> | undefined) ?? undefined;
+
+  api.logger.info(`[openclaw-cc-bridge] env: ${env ? Object.keys(env).join(", ") : "(none)"}`);
+  if (env?.ANTHROPIC_BASE_URL) {
+    api.logger.info(`[openclaw-cc-bridge] ANTHROPIC_BASE_URL: ${env.ANTHROPIC_BASE_URL}`);
+  }
 
   const bridge = new ClaudeBridge({
     allowedTools,
+    env,
     maxTimeoutRetries: 2,
     onTimeoutRetry: (attempt, maxRetries, sessionId) => {
       api.logger.info(
@@ -95,7 +126,251 @@ export default function register(api: PluginApi) {
     api.logger.debug(`[openclaw-cc-bridge] Hook config ensured at ${hookConfigPath}`);
   }
 
-  // --- Background service: Hook Inbox ---
+  // =====================================================================
+  // Shared logic: used by both command handlers and agent tools
+  // =====================================================================
+
+  async function doSend(senderId: string, workspace: string, prompt: string): Promise<string> {
+    if (!existsSync(workspace)) {
+      return `Workspace does not exist: ${workspace}`;
+    }
+
+    const wsSession = sessions.getSession(senderId, workspace);
+    const existingSession = wsSession?.claudeSessionId;
+
+    if (sessions.hasPendingPlan(senderId, workspace)) {
+      sessions.setPendingPlan(senderId, workspace, false);
+    }
+
+    let effectivePrompt = prompt;
+    const pq = sessions.getPendingQuestion(senderId, workspace);
+    if (pq) {
+      effectivePrompt = `The user responded to your previous question with: "${prompt}"\nPlease continue based on their choice.`;
+      sessions.setPendingQuestion(senderId, workspace, undefined);
+    }
+
+    api.logger.info(
+      `[openclaw-cc-bridge] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}`
+    );
+
+    ensureHookConfig(workspace);
+
+    const run = await runManager.execute({
+      prompt: effectivePrompt,
+      workspace,
+      sessionId: existingSession,
+      isNewSession: !existingSession,
+    });
+
+    sessions.updateSession(senderId, workspace, run.response.session_id);
+    sessions.setActiveWorkspace(senderId, workspace);
+
+    if (run.response.pendingQuestion) {
+      sessions.setPendingQuestion(senderId, workspace, run.response.pendingQuestion);
+    }
+
+    return run.composedMarkdown;
+  }
+
+  async function doPlan(senderId: string, workspace: string, prompt: string): Promise<string> {
+    if (!existsSync(workspace)) {
+      return `Workspace does not exist: ${workspace}`;
+    }
+
+    if (sessions.hasPendingPlan(senderId, workspace)) {
+      return [
+        `There is already a pending plan for workspace: ${workspace}`,
+        "Use cc_execute to proceed, cc_reset to discard, or cc_plan again to replace it.",
+      ].join("\n");
+    }
+
+    const wsSession = sessions.getSession(senderId, workspace);
+    const existingSession = wsSession?.claudeSessionId;
+
+    api.logger.info(
+      `[openclaw-cc-bridge] [plan] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}`
+    );
+
+    ensureHookConfig(workspace);
+
+    const run = await runManager.execute({
+      prompt,
+      workspace,
+      sessionId: existingSession,
+      isNewSession: !existingSession,
+      promptLabel: "[plan]",
+      permissionMode: "plan",
+    });
+
+    sessions.updateSession(senderId, workspace, run.response.session_id);
+    sessions.setActiveWorkspace(senderId, workspace);
+    sessions.setPendingPlan(senderId, workspace, true);
+
+    let text = run.composedMarkdown;
+    text += "\n\n---";
+    text += "\nTo proceed: use cc_execute tool";
+    text += "\nTo discard: use cc_reset tool";
+
+    return text;
+  }
+
+  async function doExecute(senderId: string, workspace: string, notes?: string): Promise<string> {
+    if (!sessions.hasPendingPlan(senderId, workspace)) {
+      return `No pending plan for workspace: ${workspace}\nUse cc_plan to create one first.`;
+    }
+
+    const wsSession = sessions.getSession(senderId, workspace);
+    const existingSession = wsSession?.claudeSessionId;
+
+    if (!existingSession) {
+      return "Session lost. Use cc_plan to create a new plan.";
+    }
+
+    const executePrompt = notes
+      ? `Proceed with the plan. Additional notes: ${notes}`
+      : "Proceed with the plan.";
+
+    api.logger.info(
+      `[openclaw-cc-bridge] [execute] [${workspace}] resuming session ${existingSession} from ${senderId}`
+    );
+
+    sessions.setPendingPlan(senderId, workspace, false);
+
+    try {
+      ensureHookConfig(workspace);
+
+      const run = await runManager.execute({
+        prompt: executePrompt,
+        workspace,
+        sessionId: existingSession,
+      });
+
+      sessions.updateSession(senderId, workspace, run.response.session_id);
+
+      return run.composedMarkdown;
+    } catch (err) {
+      sessions.setPendingPlan(senderId, workspace, true);
+      throw err;
+    }
+  }
+
+  function doWorkspace(senderId: string, path?: string): string {
+    if (!path) {
+      const activeWs = sessions.getActiveWorkspace(senderId);
+      const allSessions = sessions.listSessions(senderId);
+
+      const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace."];
+
+      if (allSessions.length > 0) {
+        lines.push("", "All workspace sessions:");
+        for (const ws of allSessions) {
+          const marker = ws.workspace === activeWs ? " *" : "";
+          const planTag = ws.pendingPlan ? " [pending plan]" : "";
+          const questionTag = ws.pendingQuestion ? " [awaiting reply]" : "";
+          lines.push(
+            `  ${ws.workspace}${marker}${planTag}${questionTag} (${ws.messageCount} messages)`
+          );
+        }
+      }
+
+      return lines.join("\n");
+    }
+
+    const absPath = resolve(path);
+
+    if (!existsSync(absPath)) {
+      return `Directory does not exist: ${absPath}`;
+    }
+
+    const previousActive = sessions.getActiveWorkspace(senderId);
+    sessions.setActiveWorkspace(senderId, absPath);
+    ensureHookConfig(absPath);
+
+    const changed = previousActive !== absPath;
+    const existingSession = sessions.getSession(senderId, absPath);
+    const sessionInfo = existingSession
+      ? `Existing session found (${existingSession.messageCount} messages).`
+      : "No existing session. Next message starts a new conversation.";
+
+    return changed
+      ? `Active workspace set to: ${absPath}\n${sessionInfo}`
+      : `Active workspace already set to: ${absPath}`;
+  }
+
+  function doReset(senderId: string, workspace?: string, all?: boolean): string {
+    if (all) {
+      const count = sessions.removeAllSessions(senderId);
+      return count > 0
+        ? `Reset ${count} workspace session(s). Next message starts fresh.`
+        : "No active sessions to reset.";
+    }
+
+    const targetWs = workspace ? resolve(workspace) : sessions.getActiveWorkspace(senderId);
+    if (!targetWs) {
+      return "No active workspace to reset.";
+    }
+
+    const removed = sessions.removeSession(senderId, targetWs);
+    return removed
+      ? `Session reset for workspace: ${targetWs}\nNext message starts a new conversation.`
+      : `No active session for workspace: ${targetWs}`;
+  }
+
+  function doStatus(senderId: string, workspace?: string): string {
+    const activeWs = sessions.getActiveWorkspace(senderId);
+
+    if (workspace) {
+      const absWs = resolve(workspace);
+      const ws = sessions.getSession(senderId, absWs);
+      if (!ws) {
+        return `No active session for workspace: ${absWs}`;
+      }
+      const active = ws.workspace === activeWs ? " (active)" : "";
+      const lines = [
+        `### ${ws.workspace}${active}`,
+        `Session: ${ws.claudeSessionId || "(new)"}`,
+        `Messages: ${ws.messageCount}`,
+        `Last active: ${new Date(ws.lastActive).toISOString()}`,
+      ];
+      if (ws.pendingPlan) {
+        lines.push("Plan: pending (use cc_execute to proceed)");
+      }
+      if (ws.pendingQuestion) {
+        lines.push("Question: Claude is waiting for your reply (use cc_send to answer)");
+      }
+      return lines.join("\n");
+    }
+
+    const allSessions = sessions.listSessions(senderId);
+
+    if (allSessions.length === 0) {
+      return "No active sessions.\nUse cc_workspace to set a workspace.";
+    }
+
+    const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace.", ""];
+
+    for (const ws of allSessions) {
+      const active = ws.workspace === activeWs ? " (active)" : "";
+      lines.push(`### ${ws.workspace}${active}`);
+      lines.push(`Session: ${ws.claudeSessionId || "(new)"}`);
+      lines.push(`Messages: ${ws.messageCount}`);
+      lines.push(`Last active: ${new Date(ws.lastActive).toISOString()}`);
+      if (ws.pendingPlan) {
+        lines.push("Plan: pending (use cc_execute to proceed)");
+      }
+      if (ws.pendingQuestion) {
+        lines.push("Question: Claude is waiting for your reply (use cc_send to answer)");
+      }
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  }
+
+  // =====================================================================
+  // Background service: Hook Inbox
+  // =====================================================================
+
   api.registerService({
     id: "claude-hook-inbox",
     start: async () => {
@@ -109,7 +384,10 @@ export default function register(api: PluginApi) {
     },
   });
 
-  // --- /cc [-w <path>] <message> ---
+  // =====================================================================
+  // Slash commands (user-facing via chat)
+  // =====================================================================
+
   api.registerCommand({
     name: "cc",
     description: "Send a message to Claude Code for processing",
@@ -129,62 +407,21 @@ export default function register(api: PluginApi) {
             "Example: /cc -w /path/to/project fix the bug",
             "",
             "Other commands:",
-            "  /cc-plan <message>    — create a plan first (read-only)",
-            "  /cc-execute           — execute a pending plan",
-            "  /cc-workspace <path>  — set/list working directory",
-            "  /cc-reset             — reset session(s)",
-            "  /cc-status            — show all session info",
+            "  /cc_plan <message>    — create a plan first (read-only)",
+            "  /cc_execute           — execute a pending plan",
+            "  /cc_workspace <path>  — set/list working directory",
+            "  /cc_reset             — reset session(s)",
+            "  /cc_status            — show all session info",
           ].join("\n"),
         };
       }
 
       if (!workspace) {
-        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc -w <path> <message>." };
-      }
-
-      if (!existsSync(workspace)) {
-        return { text: `Workspace does not exist: ${workspace}` };
-      }
-
-      const wsSession = sessions.getSession(ctx.senderId, workspace);
-      const existingSession = wsSession?.claudeSessionId;
-
-      // Using /cc while a plan is pending clears the plan state
-      if (sessions.hasPendingPlan(ctx.senderId, workspace)) {
-        sessions.setPendingPlan(ctx.senderId, workspace, false);
-      }
-
-      // If there's a pending question, wrap the user's reply as a response
-      let effectivePrompt = prompt;
-      const pq = sessions.getPendingQuestion(ctx.senderId, workspace);
-      if (pq) {
-        effectivePrompt = `The user responded to your previous question with: "${prompt}"\nPlease continue based on their choice.`;
-        sessions.setPendingQuestion(ctx.senderId, workspace, undefined);
+        return { text: "No active workspace. Use /cc_workspace <path> to set one, or /cc -w <path> <message>." };
       }
 
       try {
-        api.logger.info(
-          `[openclaw-cc-bridge] [${workspace}] "${prompt.slice(0, 50)}..." from ${ctx.senderId}`
-        );
-
-        ensureHookConfig(workspace);
-
-        const run = await runManager.execute({
-          prompt: effectivePrompt,
-          workspace,
-          sessionId: existingSession,
-          isNewSession: !existingSession,
-        });
-
-        sessions.updateSession(ctx.senderId, workspace, run.response.session_id);
-        sessions.setActiveWorkspace(ctx.senderId, workspace);
-
-        // Track pending question state
-        if (run.response.pendingQuestion) {
-          sessions.setPendingQuestion(ctx.senderId, workspace, run.response.pendingQuestion);
-        }
-
-        return { text: run.composedMarkdown };
+        return { text: await doSend(ctx.senderId, workspace, prompt) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] Error: ${msg}`);
@@ -193,9 +430,8 @@ export default function register(api: PluginApi) {
     },
   });
 
-  // --- /cc-plan [-w <path>] <message> ---
   api.registerCommand({
-    name: "cc-plan",
+    name: "cc_plan",
     description:
       "Ask Claude Code to analyze and create a plan (read-only, no modifications)",
     acceptsArgs: true,
@@ -209,65 +445,24 @@ export default function register(api: PluginApi) {
       if (!prompt) {
         return {
           text: [
-            "Usage: /cc-plan [-w <workspace>] <your task description>",
-            "Example: /cc-plan refactor the authentication module",
+            "Usage: /cc_plan [-w <workspace>] <your task description>",
+            "Example: /cc_plan refactor the authentication module",
             "",
             "Claude will analyze the codebase and produce an implementation plan",
             "without making any changes. Review the plan, then:",
-            "  /cc-execute           — execute the plan as-is",
-            "  /cc-execute <notes>   — execute with additional instructions",
-            "  /cc-reset             — discard the plan",
+            "  /cc_execute           — execute the plan as-is",
+            "  /cc_execute <notes>   — execute with additional instructions",
+            "  /cc_reset             — discard the plan",
           ].join("\n"),
         };
       }
 
       if (!workspace) {
-        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc-plan -w <path> <message>." };
+        return { text: "No active workspace. Use /cc_workspace <path> to set one, or /cc_plan -w <path> <message>." };
       }
-
-      if (!existsSync(workspace)) {
-        return { text: `Workspace does not exist: ${workspace}` };
-      }
-
-      // If there is already a pending plan for this workspace, warn the user
-      if (sessions.hasPendingPlan(ctx.senderId, workspace)) {
-        return {
-          text: [
-            `There is already a pending plan for workspace: ${workspace}`,
-            "Use /cc-execute to proceed, /cc-reset to discard, or /cc-plan again to replace it.",
-          ].join("\n"),
-        };
-      }
-
-      const wsSession = sessions.getSession(ctx.senderId, workspace);
-      const existingSession = wsSession?.claudeSessionId;
 
       try {
-        api.logger.info(
-          `[openclaw-cc-bridge] [plan] [${workspace}] "${prompt.slice(0, 50)}..." from ${ctx.senderId}`
-        );
-
-        ensureHookConfig(workspace);
-
-        const run = await runManager.execute({
-          prompt,
-          workspace,
-          sessionId: existingSession,
-          isNewSession: !existingSession,
-          promptLabel: "[plan]",
-          permissionMode: "plan",
-        });
-
-        sessions.updateSession(ctx.senderId, workspace, run.response.session_id);
-        sessions.setActiveWorkspace(ctx.senderId, workspace);
-        sessions.setPendingPlan(ctx.senderId, workspace, true);
-
-        let text = run.composedMarkdown;
-        text += "\n\n---";
-        text += "\nTo proceed: `/cc-execute` or `/cc-execute <additional notes>`";
-        text += "\nTo discard: `/cc-reset`";
-
-        return { text };
+        return { text: await doPlan(ctx.senderId, workspace, prompt) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [plan] Error: ${msg}`);
@@ -276,9 +471,8 @@ export default function register(api: PluginApi) {
     },
   });
 
-  // --- /cc-execute [-w <path>] [notes] ---
   api.registerCommand({
-    name: "cc-execute",
+    name: "cc_execute",
     description: "Execute a previously created plan",
     acceptsArgs: true,
     requireAuth: true,
@@ -289,50 +483,12 @@ export default function register(api: PluginApi) {
       );
 
       if (!workspace) {
-        return { text: "No active workspace. Use /cc-workspace <path> to set one, or /cc-execute -w <path>." };
+        return { text: "No active workspace. Use /cc_workspace <path> to set one, or /cc_execute -w <path>." };
       }
-
-      if (!sessions.hasPendingPlan(ctx.senderId, workspace)) {
-        return {
-          text: `No pending plan for workspace: ${workspace}\nUse /cc-plan <message> to create one first.`,
-        };
-      }
-
-      const wsSession = sessions.getSession(ctx.senderId, workspace);
-      const existingSession = wsSession?.claudeSessionId;
-
-      if (!existingSession) {
-        return {
-          text: "Session lost. Use /cc-plan to create a new plan.",
-        };
-      }
-
-      const executePrompt = additionalNotes
-        ? `Proceed with the plan. Additional notes: ${additionalNotes}`
-        : "Proceed with the plan.";
 
       try {
-        api.logger.info(
-          `[openclaw-cc-bridge] [execute] [${workspace}] resuming session ${existingSession} from ${ctx.senderId}`
-        );
-
-        // Clear pending plan before execution
-        sessions.setPendingPlan(ctx.senderId, workspace, false);
-
-        ensureHookConfig(workspace);
-
-        const run = await runManager.execute({
-          prompt: executePrompt,
-          workspace,
-          sessionId: existingSession,
-        });
-
-        sessions.updateSession(ctx.senderId, workspace, run.response.session_id);
-
-        return { text: run.composedMarkdown };
+        return { text: await doExecute(ctx.senderId, workspace, additionalNotes || undefined) };
       } catch (err) {
-        // Restore pending plan state on failure so user can retry
-        sessions.setPendingPlan(ctx.senderId, workspace, true);
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [execute] Error: ${msg}`);
         return { text: `Error executing plan: ${msg}` };
@@ -340,183 +496,200 @@ export default function register(api: PluginApi) {
     },
   });
 
-  // --- /cc-workspace [path] ---
   api.registerCommand({
-    name: "cc-workspace",
+    name: "cc_workspace",
     description: "Set or list working directories for Claude Code",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
       const rawPath = ctx.args.trim();
-
-      // No argument: show active workspace and all workspace sessions
-      if (!rawPath) {
-        const activeWs = sessions.getActiveWorkspace(ctx.senderId);
-        const allSessions = sessions.listSessions(ctx.senderId);
-
-        const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace."];
-
-        if (allSessions.length > 0) {
-          lines.push("", "All workspace sessions:");
-          for (const ws of allSessions) {
-            const marker = ws.workspace === activeWs ? " *" : "";
-            const planTag = ws.pendingPlan ? " [pending plan]" : "";
-            const questionTag = ws.pendingQuestion ? " [awaiting reply]" : "";
-            lines.push(
-              `  ${ws.workspace}${marker}${planTag}${questionTag} (${ws.messageCount} messages)`
-            );
-          }
-        }
-
-        lines.push("", "Usage: /cc-workspace /path/to/project");
-        return { text: lines.join("\n") };
-      }
-
-      const absPath = resolve(rawPath);
-
-      if (!existsSync(absPath)) {
-        return { text: `Directory does not exist: ${absPath}` };
-      }
-
-      const previousActive = sessions.getActiveWorkspace(ctx.senderId);
-      sessions.setActiveWorkspace(ctx.senderId, absPath);
-
-      // Ensure hook config exists in the new workspace
-      ensureHookConfig(absPath);
-
-      const changed = previousActive !== absPath;
-      const existingSession = sessions.getSession(ctx.senderId, absPath);
-      const sessionInfo = existingSession
-        ? `Existing session found (${existingSession.messageCount} messages).`
-        : "No existing session. Next /cc message starts a new conversation.";
-
-      return {
-        text: changed
-          ? `Active workspace set to: ${absPath}\n${sessionInfo}`
-          : `Active workspace already set to: ${absPath}`,
-      };
+      return { text: doWorkspace(ctx.senderId, rawPath || undefined) };
     },
   });
 
-  // --- /cc-reset [-w <path> | --all] ---
   api.registerCommand({
-    name: "cc-reset",
+    name: "cc_reset",
     description: "Reset Claude Code session(s)",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
       const args = ctx.args.trim();
 
-      // --all: reset all workspace sessions
       if (args === "--all") {
-        const count = sessions.removeAllSessions(ctx.senderId);
-        return {
-          text:
-            count > 0
-              ? `Reset ${count} workspace session(s). Next /cc message starts fresh.`
-              : "No active sessions to reset.",
-        };
+        return { text: doReset(ctx.senderId, undefined, true) };
       }
 
-      // -w <path>: reset specific workspace
       const wsMatch = args.match(/^(?:-w|--workspace)\s+(\S+)$/);
       if (wsMatch) {
-        const workspace = resolve(wsMatch[1]);
-        const removed = sessions.removeSession(ctx.senderId, workspace);
-        return {
-          text: removed
-            ? `Session reset for workspace: ${workspace}`
-            : `No active session for workspace: ${workspace}`,
-        };
+        return { text: doReset(ctx.senderId, wsMatch[1]) };
       }
 
-      // No args: reset active workspace session
       if (!args) {
-        const activeWs = sessions.getActiveWorkspace(ctx.senderId);
-        if (!activeWs) {
-          return { text: "No active workspace. Use /cc-reset -w <path> to reset a specific workspace." };
-        }
-        const removed = sessions.removeSession(ctx.senderId, activeWs);
-        return {
-          text: removed
-            ? `Session reset for workspace: ${activeWs}\nNext /cc message starts a new conversation.`
-            : "No active session to reset.",
-        };
+        return { text: doReset(ctx.senderId) };
       }
 
       return {
         text: [
           "Usage:",
-          "  /cc-reset              — reset active workspace session",
-          "  /cc-reset -w <path>    — reset specific workspace session",
-          "  /cc-reset --all        — reset all workspace sessions",
+          "  /cc_reset              — reset active workspace session",
+          "  /cc_reset -w <path>    — reset specific workspace session",
+          "  /cc_reset --all        — reset all workspace sessions",
         ].join("\n"),
       };
     },
   });
 
-  // --- /cc-status [-w <path>] ---
   api.registerCommand({
-    name: "cc-status",
+    name: "cc_status",
     description: "Show Claude Code session status",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
-      const activeWs = sessions.getActiveWorkspace(ctx.senderId);
-      const { workspace: filterWs, rest } = parseWorkspaceArg(
-        ctx.args.trim(),
-        ""
-      );
-      // If -w was specified, show only that workspace
-      const specificWorkspace = filterWs || undefined;
+      const { workspace: filterWs } = parseWorkspaceArg(ctx.args.trim(), "");
+      return { text: doStatus(ctx.senderId, filterWs || undefined) };
+    },
+  });
 
-      if (specificWorkspace) {
-        const ws = sessions.getSession(ctx.senderId, specificWorkspace);
-        if (!ws) {
-          return { text: `No active session for workspace: ${specificWorkspace}` };
-        }
-        const active = ws.workspace === activeWs ? " (active)" : "";
-        const lines = [
-          `### ${ws.workspace}${active}`,
-          `Session: ${ws.claudeSessionId || "(new)"}`,
-          `Messages: ${ws.messageCount}`,
-          `Last active: ${new Date(ws.lastActive).toISOString()}`,
-        ];
-        if (ws.pendingPlan) {
-          lines.push("Plan: pending (use /cc-execute to proceed)");
-        }
-        if (ws.pendingQuestion) {
-          lines.push("Question: Claude is waiting for your reply (use /cc to answer)");
-        }
-        return { text: lines.join("\n") };
+  // =====================================================================
+  // Agent tools (LLM-callable via registerTool)
+  // =====================================================================
+
+  api.registerTool({
+    name: "cc_send",
+    description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The task or message for Claude Code" },
+        workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+      },
+      required: ["message"],
+    },
+    async execute(_id, params) {
+      const message = params.message as string;
+      const workspace = (params.workspace as string | undefined)
+        ? resolve(params.workspace as string)
+        : sessions.getActiveWorkspace(AGENT_SENDER_ID);
+
+      if (!workspace) {
+        return textResult("No active workspace. Use cc_workspace tool to set one first.");
       }
 
-      const allSessions = sessions.listSessions(ctx.senderId);
+      try {
+        return textResult(await doSend(AGENT_SENDER_ID, workspace, message));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        api.logger.error(`[openclaw-cc-bridge] [tool:cc_send] Error: ${msg}`);
+        return textResult(`Error from Claude Code: ${msg}`);
+      }
+    },
+  });
 
-      if (allSessions.length === 0) {
-        return {
-          text: "No active sessions.\nUse /cc-workspace <path> to set a workspace.",
-        };
+  api.registerTool({
+    name: "cc_plan",
+    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The task description to plan for" },
+        workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+      },
+      required: ["message"],
+    },
+    async execute(_id, params) {
+      const message = params.message as string;
+      const workspace = (params.workspace as string | undefined)
+        ? resolve(params.workspace as string)
+        : sessions.getActiveWorkspace(AGENT_SENDER_ID);
+
+      if (!workspace) {
+        return textResult("No active workspace. Use cc_workspace tool to set one first.");
       }
 
-      const lines = [activeWs ? `Active workspace: ${activeWs}` : "No active workspace.", ""];
+      try {
+        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        api.logger.error(`[openclaw-cc-bridge] [tool:cc_plan] Error: ${msg}`);
+        return textResult(`Error from Claude Code (plan): ${msg}`);
+      }
+    },
+  });
 
-      for (const ws of allSessions) {
-        const active = ws.workspace === activeWs ? " (active)" : "";
-        lines.push(`### ${ws.workspace}${active}`);
-        lines.push(`Session: ${ws.claudeSessionId || "(new)"}`);
-        lines.push(`Messages: ${ws.messageCount}`);
-        lines.push(`Last active: ${new Date(ws.lastActive).toISOString()}`);
-        if (ws.pendingPlan) {
-          lines.push("Plan: pending (use /cc-execute to proceed)");
-        }
-        if (ws.pendingQuestion) {
-          lines.push("Question: Claude is waiting for your reply (use /cc to answer)");
-        }
-        lines.push("");
+  api.registerTool({
+    name: "cc_execute",
+    description: "Execute a previously created plan. Must call cc_plan first to create a plan before using this tool.",
+    parameters: {
+      type: "object",
+      properties: {
+        notes: { type: "string", description: "Optional additional instructions or adjustments for the execution" },
+        workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+      },
+    },
+    async execute(_id, params) {
+      const notes = params.notes as string | undefined;
+      const workspace = (params.workspace as string | undefined)
+        ? resolve(params.workspace as string)
+        : sessions.getActiveWorkspace(AGENT_SENDER_ID);
+
+      if (!workspace) {
+        return textResult("No active workspace. Use cc_workspace tool to set one first.");
       }
 
-      return { text: lines.join("\n") };
+      try {
+        return textResult(await doExecute(AGENT_SENDER_ID, workspace, notes));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        api.logger.error(`[openclaw-cc-bridge] [tool:cc_execute] Error: ${msg}`);
+        return textResult(`Error executing plan: ${msg}`);
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "cc_workspace",
+    description: "Set or list the active workspace directory for Claude Code sessions. Call without arguments to list all workspaces.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Directory path to set as active workspace. Omit to list current workspaces." },
+      },
+    },
+    async execute(_id, params) {
+      const path = params.path as string | undefined;
+      return textResult(doWorkspace(AGENT_SENDER_ID, path));
+    },
+  });
+
+  api.registerTool({
+    name: "cc_reset",
+    description: "Reset Claude Code session(s). Clears conversation history so the next message starts a fresh session.",
+    parameters: {
+      type: "object",
+      properties: {
+        workspace: { type: "string", description: "Workspace path to reset. If omitted, resets the active workspace." },
+        all: { type: "boolean", description: "If true, reset all workspace sessions." },
+      },
+    },
+    async execute(_id, params) {
+      const workspace = params.workspace as string | undefined;
+      const all = params.all as boolean | undefined;
+      return textResult(doReset(AGENT_SENDER_ID, workspace, all));
+    },
+  });
+
+  api.registerTool({
+    name: "cc_status",
+    description: "Show Claude Code session status including active workspace, session IDs, message counts, and pending plans.",
+    parameters: {
+      type: "object",
+      properties: {
+        workspace: { type: "string", description: "Show status for a specific workspace. If omitted, shows all sessions." },
+      },
+    },
+    async execute(_id, params) {
+      const workspace = params.workspace as string | undefined;
+      return textResult(doStatus(AGENT_SENDER_ID, workspace));
     },
   });
 

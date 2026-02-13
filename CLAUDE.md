@@ -50,6 +50,28 @@ npm run dev      # tsc --watch
 npm run debug    # build + run debug server
 ```
 
+## Plugin Config
+
+Configured via OpenClaw's plugin config (`configSchema` in `openclaw.plugin.json`):
+
+| Key | Type | Description |
+|---|---|---|
+| `env` | `Record<string, string>` | Environment variables passed to the Claude Code process. The plugin strips all `ANTHROPIC_*` and `CLAUDE_*` vars from the parent process env to prevent leakage, then merges these values in. Use this to set `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, etc. |
+| `allowedTools` | `string[]` | Claude Code tool names to allow (e.g. `["Bash", "Read", "Write"]`). If omitted, defaults to `["Read", "Edit", "Write", "Bash", "Glob", "Grep"]`. |
+
+Example config:
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-api-relay.example.com",
+    "ANTHROPIC_API_KEY": "sk-..."
+  },
+  "allowedTools": ["Read", "Edit", "Write", "Bash", "Glob", "Grep", "Task"]
+}
+```
+
+> **Note:** If `ANTHROPIC_BASE_URL` points to a LAN address and the gateway runs as a macOS launchd agent, local network connections may be blocked by macOS Local Network Privacy. See [troubleshoot.md](./troubleshoot.md) for details.
+
 ## Environment Variables
 
 - `OPENCLAW_CC_DATA_DIR` — Data persistence directory (default: `~/.openclaw/openclaw-cc-bridge`)
