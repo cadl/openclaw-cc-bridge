@@ -60,6 +60,6 @@ npm run debug    # build + run debug server
 - All source in `src/`, compiled output in `dist/`
 - Data persisted as JSON/JSONL files under `~/.openclaw/openclaw-cc-bridge/`
 - Claude Code spawned with `--output-format stream-json --verbose` for NDJSON parsing
-- Hook inbox: Claude Code hooks append to JSONL files in `~/.openclaw/openclaw-cc-bridge/hook-inbox/`, watched by `HookInbox` via fs.watch + polling fallback. Config written to `.claude/settings.local.json` per workspace.
+- Hook inbox: All Claude Code hooks append to a single `events.jsonl` file in `~/.openclaw/openclaw-cc-bridge/hook-inbox/`, watched by `HookInbox` via fs.watch + polling fallback. Event type is determined from the `hook_event_name` field in each payload. Config written to `.claude/settings.local.json` per workspace.
 - Multi-workspace session model: each sender has an active workspace with independent session state (sessionId, pendingPlan, pendingQuestion)
 - RunManager coordinates ClaudeBridge + HookInbox + EventStore per execution, with 100ms post-delay for trailing hook events
