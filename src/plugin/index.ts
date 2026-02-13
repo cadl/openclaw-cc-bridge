@@ -591,7 +591,7 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_send",
-    description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase.",
+    description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase. Present the full result to the user exactly as returned — do not summarize or rephrase.",
     parameters: {
       type: "object",
       properties: {
@@ -624,7 +624,7 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_plan",
-    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing.",
+    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing. Present the full result to the user exactly as returned — do not summarize or rephrase.",
     parameters: {
       type: "object",
       properties: {
@@ -657,7 +657,7 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_execute",
-    description: "Execute a previously created plan. Must call cc_plan first to create a plan before using this tool.",
+    description: "Execute a previously created plan. Must call cc_plan first to create a plan before using this tool. Present the full result to the user exactly as returned — do not summarize or rephrase.",
     parameters: {
       type: "object",
       properties: {

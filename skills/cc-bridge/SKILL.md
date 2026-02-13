@@ -93,3 +93,11 @@ Parameters:
 - Using `cc_send` while a plan is pending discards the plan and processes the message directly.
 - Use `cc_reset` when context seems stale or Claude Code is confused by prior conversation.
 - Model can be specified per-invocation or as a global default in plugin config. Per-invocation overrides the default. Available models: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`.
+
+## Output handling
+
+**CRITICAL**: When you receive results from `cc_send`, `cc_plan`, or `cc_execute` tools, you MUST:
+- Return the complete tool result to the user **exactly as received**, without any modification, summarization, or rephrasing
+- Do NOT add your own analysis, commentary, or interpretation of the results
+- Do NOT truncate, shorten, or omit any part of the output
+- The tool output is already formatted for the user — present it verbatim as your response
