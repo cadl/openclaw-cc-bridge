@@ -26,6 +26,7 @@ Send a message to Claude Code for immediate processing.
 Parameters:
 - `message` (string, required) — The task or message for Claude Code
 - `workspace` (string, optional) — Workspace directory path. If omitted, uses the active workspace.
+- `model` (string, optional) — Model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. If omitted, uses configured default.
 
 Use for: writing code, fixing bugs, refactoring, running commands, asking questions about a codebase.
 
@@ -36,6 +37,7 @@ Create a read-only implementation plan without making any changes.
 Parameters:
 - `message` (string, required) — The task description to plan for
 - `workspace` (string, optional) — Workspace directory path. If omitted, uses the active workspace.
+- `model` (string, optional) — Model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. If omitted, uses configured default.
 
 Use for: complex or high-risk changes where you want to review before executing. After creating a plan, use `cc_execute` to proceed or `cc_reset` to discard.
 
@@ -46,6 +48,7 @@ Execute a previously created plan.
 Parameters:
 - `notes` (string, optional) — Additional instructions or adjustments for the execution
 - `workspace` (string, optional) — Workspace directory path. If omitted, uses the active workspace.
+- `model` (string, optional) — Model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. If omitted, uses configured default.
 
 Must call `cc_plan` first to create a plan before using this tool.
 
@@ -89,3 +92,4 @@ Parameters:
 - If Claude Code asks a question, respond with `cc_send({ message: "your answer" })`.
 - Using `cc_send` while a plan is pending discards the plan and processes the message directly.
 - Use `cc_reset` when context seems stale or Claude Code is confused by prior conversation.
+- Model can be specified per-invocation or as a global default in plugin config. Per-invocation overrides the default. Available models: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`.

@@ -56,6 +56,7 @@ Configured via OpenClaw's plugin config (`configSchema` in `openclaw.plugin.json
 
 | Key | Type | Description |
 |---|---|---|
+| `model` | `string` | Default Claude model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. Can be overridden per-invocation via `-m` flag or `model` tool parameter. If omitted, uses Claude CLI default. |
 | `env` | `Record<string, string>` | Environment variables passed to the Claude Code process. The plugin strips all `ANTHROPIC_*` and `CLAUDE_*` vars from the parent process env to prevent leakage, then merges these values in. Use this to set `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, etc. |
 | `allowedTools` | `string[]` | Claude Code tool names to allow (e.g. `["Bash", "Read", "Write"]`). If omitted, defaults to `["Read", "Edit", "Write", "Bash", "Glob", "Grep"]`. |
 

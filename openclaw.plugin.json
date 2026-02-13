@@ -7,6 +7,11 @@
   "configSchema": {
     "type": "object",
     "properties": {
+      "model": {
+        "type": "string",
+        "enum": ["sonnet", "opus", "haiku", "sonnet[1m]", "opusplan"],
+        "description": "Default Claude model to use. Can be overridden per-invocation. If omitted, uses Claude CLI default."
+      },
       "allowedTools": {
         "type": "array",
         "items": { "type": "string" },

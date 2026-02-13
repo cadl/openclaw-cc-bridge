@@ -45,6 +45,8 @@ export interface StreamCallbacks {
 export interface ClaudeBridgeOptions {
   /** Timeout in ms (default: 10 minutes) */
   timeout?: number;
+  /** Default model to use (e.g. "sonnet", "opus", "haiku"). Can be overridden per-call. */
+  model?: string;
   /** Tools Claude is allowed to use */
   allowedTools?: string[];
   /** Additional CLI flags */
@@ -75,6 +77,7 @@ const DEFAULT_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"];
 
 export class ClaudeBridge {
   private timeout: number;
+  private model: string | undefined;
   private allowedTools: string[];
   private extraArgs: string[];
   private extraEnv: Record<string, string>;
@@ -84,6 +87,7 @@ export class ClaudeBridge {
 
   constructor(options: ClaudeBridgeOptions = {}) {
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
+    this.model = options.model;
     this.allowedTools = options.allowedTools ?? DEFAULT_TOOLS;
     this.extraArgs = options.extraArgs ?? [];
     this.extraEnv = options.env ?? {};
@@ -114,20 +118,23 @@ export class ClaudeBridge {
    * @param sessionId - Optional session ID to resume a previous conversation
    * @param callbacks - Optional callbacks for real-time events
    * @param permissionMode - Optional permission mode (e.g., "plan" to restrict to read-only)
+   * @param model - Optional model override (e.g., "sonnet", "opus"). Overrides constructor default.
    */
   async send(
     prompt: string,
     cwd: string,
     sessionId?: string,
     callbacks?: StreamCallbacks,
-    permissionMode?: string
+    permissionMode?: string,
+    model?: string
   ): Promise<ClaudeResponse> {
     let currentPrompt = prompt;
     let currentSessionId = sessionId;
     let retryCount = 0;
+    const effectiveModel = model ?? this.model;
 
     for (let attempt = 0; attempt <= this.maxTimeoutRetries; attempt++) {
-      const args = this.buildArgs(currentPrompt, currentSessionId, permissionMode);
+      const args = this.buildArgs(currentPrompt, currentSessionId, permissionMode, effectiveModel);
 
       try {
         const response = await this.spawnAndParse("claude", args, resolve(cwd), callbacks);
@@ -158,7 +165,8 @@ export class ClaudeBridge {
   private buildArgs(
     prompt: string,
     sessionId?: string,
-    permissionMode?: string
+    permissionMode?: string,
+    model?: string
   ): string[] {
     const args = [
       "-p",
@@ -167,6 +175,10 @@ export class ClaudeBridge {
       "stream-json",
       "--verbose",
     ];
+
+    if (model) {
+      args.push("--model", model);
+    }
 
     if (sessionId) {
       args.push("--resume", sessionId);

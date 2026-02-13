@@ -28,6 +28,8 @@ export interface RunOptions {
   workspace: string;
   sessionId?: string;
   permissionMode?: string;
+  /** Model override for this run (e.g. "sonnet", "opus"). */
+  model?: string;
   /** Whether this is a new session (affects firstPrompt metadata). */
   isNewSession?: boolean;
   /** Label prefix for firstPrompt metadata (e.g. "[plan]"). */
@@ -202,6 +204,7 @@ export class RunManager {
           },
         },
         opts.permissionMode,
+        opts.model,
       );
 
       // Wait briefly for trailing async hook events

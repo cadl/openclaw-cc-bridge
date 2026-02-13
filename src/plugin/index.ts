@@ -78,6 +78,25 @@ function parseWorkspaceArg(
   return { workspace: activeWorkspace, rest: args };
 }
 
+const VALID_MODELS = ["sonnet", "opus", "haiku", "sonnet[1m]", "opusplan"];
+
+/**
+ * Parse -m / --model flag from command args.
+ * Returns the model name and the remaining args with the flag removed.
+ */
+function parseModelArg(args: string): { model: string | undefined; rest: string } {
+  const match = args.match(/(?:^|\s)(?:-m|--model)\s+(\S+)/);
+  if (match) {
+    const model = match[1];
+    const rest = args.replace(match[0], "").trim();
+    if (!VALID_MODELS.includes(model)) {
+      return { model: undefined, rest: args };
+    }
+    return { model, rest };
+  }
+  return { model: undefined, rest: args };
+}
+
 /** Helper: wrap text in a ToolResult. */
 function textResult(text: string): ToolResult {
   return { content: [{ type: "text", text }] };
@@ -93,15 +112,21 @@ export default function register(api: PluginApi) {
     (pluginConfig.allowedTools as string[] | undefined) ?? undefined;
   const env =
     (pluginConfig.env as Record<string, string> | undefined) ?? undefined;
+  const defaultModel =
+    (pluginConfig.model as string | undefined) ?? undefined;
 
   api.logger.info(`[openclaw-cc-bridge] env: ${env ? Object.keys(env).join(", ") : "(none)"}`);
   if (env?.ANTHROPIC_BASE_URL) {
     api.logger.info(`[openclaw-cc-bridge] ANTHROPIC_BASE_URL: ${env.ANTHROPIC_BASE_URL}`);
   }
+  if (defaultModel) {
+    api.logger.info(`[openclaw-cc-bridge] default model: ${defaultModel}`);
+  }
 
   const bridge = new ClaudeBridge({
     allowedTools,
     env,
+    model: defaultModel,
     maxTimeoutRetries: 2,
     onTimeoutRetry: (attempt, maxRetries, sessionId) => {
       api.logger.info(
@@ -130,7 +155,7 @@ export default function register(api: PluginApi) {
   // Shared logic: used by both command handlers and agent tools
   // =====================================================================
 
-  async function doSend(senderId: string, workspace: string, prompt: string): Promise<string> {
+  async function doSend(senderId: string, workspace: string, prompt: string, model?: string): Promise<string> {
     if (!existsSync(workspace)) {
       return `Workspace does not exist: ${workspace}`;
     }
@@ -160,6 +185,7 @@ export default function register(api: PluginApi) {
       workspace,
       sessionId: existingSession,
       isNewSession: !existingSession,
+      model,
     });
 
     sessions.updateSession(senderId, workspace, run.response.session_id);
@@ -172,7 +198,7 @@ export default function register(api: PluginApi) {
     return run.composedMarkdown;
   }
 
-  async function doPlan(senderId: string, workspace: string, prompt: string): Promise<string> {
+  async function doPlan(senderId: string, workspace: string, prompt: string, model?: string): Promise<string> {
     if (!existsSync(workspace)) {
       return `Workspace does not exist: ${workspace}`;
     }
@@ -200,6 +226,7 @@ export default function register(api: PluginApi) {
       isNewSession: !existingSession,
       promptLabel: "[plan]",
       permissionMode: "plan",
+      model,
     });
 
     sessions.updateSession(senderId, workspace, run.response.session_id);
@@ -214,7 +241,7 @@ export default function register(api: PluginApi) {
     return text;
   }
 
-  async function doExecute(senderId: string, workspace: string, notes?: string): Promise<string> {
+  async function doExecute(senderId: string, workspace: string, notes?: string, model?: string): Promise<string> {
     if (!sessions.hasPendingPlan(senderId, workspace)) {
       return `No pending plan for workspace: ${workspace}\nUse cc_plan to create one first.`;
     }
@@ -243,6 +270,7 @@ export default function register(api: PluginApi) {
         prompt: executePrompt,
         workspace,
         sessionId: existingSession,
+        model,
       });
 
       sessions.updateSession(senderId, workspace, run.response.session_id);
@@ -394,17 +422,19 @@ export default function register(api: PluginApi) {
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
+      const { model, rest: argsAfterModel } = parseModelArg(ctx.args.trim());
       const { workspace, rest: prompt } = parseWorkspaceArg(
-        ctx.args.trim(),
+        argsAfterModel,
         sessions.getActiveWorkspace(ctx.senderId)
       );
 
       if (!prompt) {
         return {
           text: [
-            "Usage: /cc [-w <workspace>] <your message>",
+            "Usage: /cc [-m <model>] [-w <workspace>] <your message>",
             "Example: /cc fix the bug in auth.py",
-            "Example: /cc -w /path/to/project fix the bug",
+            "Example: /cc -m opus -w /path/to/project fix the bug",
+            `Models: ${VALID_MODELS.join(", ")}`,
             "",
             "Other commands:",
             "  /cc_plan <message>    — create a plan first (read-only)",
@@ -421,7 +451,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return { text: await doSend(ctx.senderId, workspace, prompt) };
+        return { text: await doSend(ctx.senderId, workspace, prompt, model) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] Error: ${msg}`);
@@ -437,16 +467,19 @@ export default function register(api: PluginApi) {
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
+      const { model, rest: argsAfterModel } = parseModelArg(ctx.args.trim());
       const { workspace, rest: prompt } = parseWorkspaceArg(
-        ctx.args.trim(),
+        argsAfterModel,
         sessions.getActiveWorkspace(ctx.senderId)
       );
 
       if (!prompt) {
         return {
           text: [
-            "Usage: /cc_plan [-w <workspace>] <your task description>",
+            "Usage: /cc_plan [-m <model>] [-w <workspace>] <your task description>",
             "Example: /cc_plan refactor the authentication module",
+            "Example: /cc_plan -m opus refactor the authentication module",
+            `Models: ${VALID_MODELS.join(", ")}`,
             "",
             "Claude will analyze the codebase and produce an implementation plan",
             "without making any changes. Review the plan, then:",
@@ -462,7 +495,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return { text: await doPlan(ctx.senderId, workspace, prompt) };
+        return { text: await doPlan(ctx.senderId, workspace, prompt, model) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [plan] Error: ${msg}`);
@@ -554,6 +587,8 @@ export default function register(api: PluginApi) {
   // Agent tools (LLM-callable via registerTool)
   // =====================================================================
 
+  const modelEnumDescription = `Model to use. Options: ${VALID_MODELS.join(", ")}. If omitted, uses the configured default or Claude CLI default.`;
+
   api.registerTool({
     name: "cc_send",
     description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase.",
@@ -562,11 +597,13 @@ export default function register(api: PluginApi) {
       properties: {
         message: { type: "string", description: "The task or message for Claude Code" },
         workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+        model: { type: "string", enum: VALID_MODELS, description: modelEnumDescription },
       },
       required: ["message"],
     },
     async execute(_id, params) {
       const message = params.message as string;
+      const model = params.model as string | undefined;
       const workspace = (params.workspace as string | undefined)
         ? resolve(params.workspace as string)
         : sessions.getActiveWorkspace(AGENT_SENDER_ID);
@@ -576,7 +613,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doSend(AGENT_SENDER_ID, workspace, message));
+        return textResult(await doSend(AGENT_SENDER_ID, workspace, message, model));
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_send] Error: ${msg}`);
@@ -593,11 +630,13 @@ export default function register(api: PluginApi) {
       properties: {
         message: { type: "string", description: "The task description to plan for" },
         workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+        model: { type: "string", enum: VALID_MODELS, description: modelEnumDescription },
       },
       required: ["message"],
     },
     async execute(_id, params) {
       const message = params.message as string;
+      const model = params.model as string | undefined;
       const workspace = (params.workspace as string | undefined)
         ? resolve(params.workspace as string)
         : sessions.getActiveWorkspace(AGENT_SENDER_ID);
@@ -607,7 +646,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message));
+        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message, model));
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_plan] Error: ${msg}`);
@@ -624,10 +663,12 @@ export default function register(api: PluginApi) {
       properties: {
         notes: { type: "string", description: "Optional additional instructions or adjustments for the execution" },
         workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
+        model: { type: "string", enum: VALID_MODELS, description: modelEnumDescription },
       },
     },
     async execute(_id, params) {
       const notes = params.notes as string | undefined;
+      const model = params.model as string | undefined;
       const workspace = (params.workspace as string | undefined)
         ? resolve(params.workspace as string)
         : sessions.getActiveWorkspace(AGENT_SENDER_ID);
@@ -637,7 +678,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doExecute(AGENT_SENDER_ID, workspace, notes));
+        return textResult(await doExecute(AGENT_SENDER_ID, workspace, notes, model));
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_execute] Error: ${msg}`);
