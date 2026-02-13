@@ -21,7 +21,7 @@ The following tools are available for direct invocation:
 
 ### cc_send
 
-Send a message to Claude Code for immediate processing.
+Send a message to Claude Code for immediate processing. Full output is saved to a `.md` file (see **Output file handling**).
 
 Parameters:
 - `message` (string, required) — The task or message for Claude Code
@@ -32,7 +32,7 @@ Use for: writing code, fixing bugs, refactoring, running commands, asking questi
 
 ### cc_plan
 
-Create a read-only implementation plan without making any changes.
+Create a read-only implementation plan without making any changes. Full output is saved to a `.md` file (see **Output file handling**).
 
 Parameters:
 - `message` (string, required) — The task description to plan for
@@ -43,7 +43,7 @@ Use for: complex or high-risk changes where you want to review before executing.
 
 ### cc_execute
 
-Execute a previously created plan.
+Execute a previously created plan. Full output is saved to a `.md` file (see **Output file handling**).
 
 Parameters:
 - `notes` (string, optional) — Additional instructions or adjustments for the execution
@@ -85,6 +85,22 @@ Parameters:
    - Review the plan output
    - `cc_execute()` or `cc_execute({ notes: "also update the tests" })`
 4. Follow-up messages continue the same session with full prior context.
+
+## Output file handling
+
+`cc_send`, `cc_plan`, and `cc_execute` save their full output verbatim to a `.md` file. The tool result starts with a line in the format:
+
+```
+**cc_output_file**: /path/to/outputs/<timestamp>-<tool>.md
+```
+
+followed by the markdown content.
+
+**You MUST follow these rules when using these three tools:**
+
+1. **Always include the `cc_output_file` path in your response.** The caller relies on this path to attach the rendered output file to the user. If you omit it, the user will not receive the full output.
+2. **Do NOT rewrite, summarize, or paraphrase the tool output.** Relay it as-is. The `.md` file is the authoritative output — your job is to pass it through, not to interpret it.
+3. **Structure your response so the caller can extract the file path.** Put the `cc_output_file` line near the top of your response.
 
 ## Behavior notes
 

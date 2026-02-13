@@ -1,4 +1,4 @@
-import { existsSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { ClaudeBridge } from "../core/claude-bridge";
 import { SessionManager } from "../core/session-manager";
@@ -60,6 +60,21 @@ const DATA_DIR =
   join(process.env.HOME || "~", ".openclaw", "openclaw-cc-bridge");
 
 const AGENT_SENDER_ID = "agent";
+
+const OUTPUTS_DIR = join(DATA_DIR, "outputs");
+
+/**
+ * Save markdown content to a .md file under OUTPUTS_DIR.
+ * Returns the absolute file path.
+ */
+function saveOutputMarkdown(tool: string, markdown: string): string {
+  mkdirSync(OUTPUTS_DIR, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `${ts}-${tool}.md`;
+  const filepath = join(OUTPUTS_DIR, filename);
+  writeFileSync(filepath, markdown, "utf-8");
+  return filepath;
+}
 
 /**
  * Parse -w / --workspace flag from command args.
@@ -591,7 +606,11 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_send",
-    description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase.",
+    description: [
+      "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase.",
+      "The full output is saved verbatim to a .md file. The tool returns the file path and the content.",
+      "IMPORTANT: You MUST include the output file path in your response so the caller can attach the file to the user. Do NOT omit or rewrite the output — relay it as-is.",
+    ].join(" "),
     parameters: {
       type: "object",
       properties: {
@@ -613,7 +632,9 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doSend(AGENT_SENDER_ID, workspace, message, model));
+        const markdown = await doSend(AGENT_SENDER_ID, workspace, message, model);
+        const filePath = saveOutputMarkdown("cc_send", markdown);
+        return textResult(`**cc_output_file**: ${filePath}\n\n${markdown}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_send] Error: ${msg}`);
@@ -624,7 +645,11 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_plan",
-    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing.",
+    description: [
+      "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing.",
+      "The full output is saved verbatim to a .md file. The tool returns the file path and the content.",
+      "IMPORTANT: You MUST include the output file path in your response so the caller can attach the file to the user. Do NOT omit or rewrite the output — relay it as-is.",
+    ].join(" "),
     parameters: {
       type: "object",
       properties: {
@@ -646,7 +671,9 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message, model));
+        const markdown = await doPlan(AGENT_SENDER_ID, workspace, message, model);
+        const filePath = saveOutputMarkdown("cc_plan", markdown);
+        return textResult(`**cc_output_file**: ${filePath}\n\n${markdown}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_plan] Error: ${msg}`);
@@ -657,7 +684,11 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_execute",
-    description: "Execute a previously created plan. Must call cc_plan first to create a plan before using this tool.",
+    description: [
+      "Execute a previously created plan. Must call cc_plan first to create a plan before using this tool.",
+      "The full output is saved verbatim to a .md file. The tool returns the file path and the content.",
+      "IMPORTANT: You MUST include the output file path in your response so the caller can attach the file to the user. Do NOT omit or rewrite the output — relay it as-is.",
+    ].join(" "),
     parameters: {
       type: "object",
       properties: {
@@ -678,7 +709,9 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return textResult(await doExecute(AGENT_SENDER_ID, workspace, notes, model));
+        const markdown = await doExecute(AGENT_SENDER_ID, workspace, notes, model);
+        const filePath = saveOutputMarkdown("cc_execute", markdown);
+        return textResult(`**cc_output_file**: ${filePath}\n\n${markdown}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_execute] Error: ${msg}`);
