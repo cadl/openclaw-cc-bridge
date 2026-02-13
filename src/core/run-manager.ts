@@ -1,5 +1,5 @@
 import { ClaudeBridge, ClaudeResponse } from "./claude-bridge";
-import { HookServer } from "./hook-server";
+import { HookInbox } from "./hook-inbox";
 import { EventStore } from "./event-store";
 import {
   composeResultMarkdown,
@@ -36,7 +36,7 @@ export interface RunOptions {
 }
 
 /** Delay in ms to wait for trailing async hook events after bridge.send() returns. */
-const HOOK_DRAIN_DELAY_MS = 200;
+const HOOK_DRAIN_DELAY_MS = 100;
 
 /**
  * Manages a single Claude Code execution run:
@@ -45,15 +45,42 @@ const HOOK_DRAIN_DELAY_MS = 200;
  * - Accumulates text, hook activities, subagent activities
  * - Persists events to EventStore
  * - Composes the final markdown result
+ *
+ * Concurrent executions on the same workspace are serialized via a
+ * per-workspace mutex to prevent hook event cross-contamination and
+ * workspace file conflicts.
  */
 export class RunManager {
+  /** Per-workspace execution mutex: maps workspace path → tail of the promise chain. */
+  private workspaceLocks = new Map<string, Promise<unknown>>();
+
   constructor(
     private bridge: ClaudeBridge,
-    private hookServer: HookServer,
+    private hookInbox: HookInbox,
     private eventStore: EventStore,
   ) {}
 
   async execute(opts: RunOptions): Promise<RunResult> {
+    // Serialize concurrent executions on the same workspace to prevent
+    // hook event cross-contamination between runs.
+    const prev = this.workspaceLocks.get(opts.workspace) ?? Promise.resolve();
+    let resolveLock: () => void;
+    const lock = new Promise<void>((r) => { resolveLock = r; });
+    this.workspaceLocks.set(opts.workspace, lock);
+
+    try {
+      await prev;
+      return await this.executeInner(opts);
+    } finally {
+      resolveLock!();
+      // Clean up map entry if no other execution is queued behind us
+      if (this.workspaceLocks.get(opts.workspace) === lock) {
+        this.workspaceLocks.delete(opts.workspace);
+      }
+    }
+  }
+
+  private async executeInner(opts: RunOptions): Promise<RunResult> {
     const hookActivities: ToolActivity[] = [];
     const subagentActivities: SubagentActivity[] = [];
     let accumulatedText = "";
@@ -126,12 +153,12 @@ export class RunManager {
     };
 
     // Register all listeners
-    this.hookServer.on("session-start", onSessionStart);
-    this.hookServer.on("tool-use", onToolUse);
-    this.hookServer.on("tool-failure", onToolFailure);
-    this.hookServer.on("subagent-start", onSubagentStart);
-    this.hookServer.on("subagent-stop", onSubagentStop);
-    this.hookServer.on("stop", onStop);
+    this.hookInbox.on("session-start", onSessionStart);
+    this.hookInbox.on("tool-use", onToolUse);
+    this.hookInbox.on("tool-failure", onToolFailure);
+    this.hookInbox.on("subagent-start", onSubagentStart);
+    this.hookInbox.on("subagent-stop", onSubagentStop);
+    this.hookInbox.on("stop", onStop);
 
     try {
       const response = await this.bridge.send(
@@ -147,19 +174,27 @@ export class RunManager {
             opts.handle?.onStreamEvent?.("text", { text, timestamp });
           },
           onSessionId: (sid, timestamp) => {
-            streamSessionId = sid;
-            const isNew = opts.isNewSession ?? !opts.sessionId;
-            const label = opts.promptLabel ? `${opts.promptLabel} ${opts.prompt}` : opts.prompt;
-            this.eventStore.ensureSession(sid, {
-              workspace: opts.workspace,
-              ...(isNew && { firstPrompt: label }),
-            });
+            if (!streamSessionId) {
+              streamSessionId = sid;
+            }
+            // Only create/update session metadata for the parent session
+            if (sid === streamSessionId) {
+              const isNew = opts.isNewSession ?? !opts.sessionId;
+              const label = opts.promptLabel ? `${opts.promptLabel} ${opts.prompt}` : opts.prompt;
+              this.eventStore.ensureSession(sid, {
+                workspace: opts.workspace,
+                ...(isNew && { firstPrompt: label }),
+              });
+            }
             opts.handle?.onStreamEvent?.("session-id", { sessionId: sid, timestamp });
           },
           onRawEvent: (event) => {
             if (event.type === "system" && event.session_id) {
-              streamSessionId = event.session_id as string;
-              this.eventStore.ensureSession(streamSessionId, { workspace: opts.workspace });
+              const sid = event.session_id as string;
+              // Only accept the first session (parent). Sub-agents carry different IDs.
+              if (!streamSessionId) {
+                streamSessionId = sid;
+              }
             }
             if (streamSessionId) {
               this.eventStore.appendStreamEvent(streamSessionId, event);
@@ -204,12 +239,12 @@ export class RunManager {
       };
     } finally {
       // Always clean up listeners
-      this.hookServer.removeListener("session-start", onSessionStart);
-      this.hookServer.removeListener("tool-use", onToolUse);
-      this.hookServer.removeListener("tool-failure", onToolFailure);
-      this.hookServer.removeListener("subagent-start", onSubagentStart);
-      this.hookServer.removeListener("subagent-stop", onSubagentStop);
-      this.hookServer.removeListener("stop", onStop);
+      this.hookInbox.removeListener("session-start", onSessionStart);
+      this.hookInbox.removeListener("tool-use", onToolUse);
+      this.hookInbox.removeListener("tool-failure", onToolFailure);
+      this.hookInbox.removeListener("subagent-start", onSubagentStart);
+      this.hookInbox.removeListener("subagent-stop", onSubagentStop);
+      this.hookInbox.removeListener("stop", onStop);
     }
   }
 }

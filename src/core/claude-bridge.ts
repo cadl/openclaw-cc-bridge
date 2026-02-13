@@ -191,14 +191,15 @@ export class ClaudeBridge {
       let planContent: string | undefined;
       let pendingQuestion: PendingQuestion | undefined;
 
+      // Parse NDJSON from stdout line-by-line
+      const rl = createInterface({ input: child.stdout });
+
       // Set timeout
       const timer = setTimeout(() => {
+        rl.close();
         child.kill("SIGTERM");
         reject(new ClaudeTimeoutError(this.timeout, sessionId || undefined, toolUses));
       }, this.timeout);
-
-      // Parse NDJSON from stdout line-by-line
-      const rl = createInterface({ input: child.stdout });
 
       rl.on("line", (line) => {
         const trimmed = line.trim();
@@ -229,6 +230,7 @@ export class ClaudeBridge {
 
       child.on("close", (code) => {
         clearTimeout(timer);
+        rl.close();
 
         if (!resultEvent) {
           const stderrMsg = stderr ? `\nstderr: ${stderr.slice(0, 500)}` : "";
@@ -255,6 +257,7 @@ export class ClaudeBridge {
 
       child.on("error", (err) => {
         clearTimeout(timer);
+        rl.close();
         reject(new Error(`Failed to spawn claude: ${err.message}`));
       });
 

@@ -2,7 +2,7 @@ import { existsSync } from "fs";
 import { join, resolve } from "path";
 import { ClaudeBridge } from "../core/claude-bridge";
 import { SessionManager } from "../core/session-manager";
-import { HookServer } from "../core/hook-server";
+import { HookInbox } from "../core/hook-inbox";
 import { EventStore } from "../core/event-store";
 import { RunManager } from "../core/run-manager";
 
@@ -79,9 +79,9 @@ export default function register(api: PluginApi) {
     },
   });
   const sessions = new SessionManager(DATA_DIR);
-  const hookServer = new HookServer();
+  const hookInbox = new HookInbox(DATA_DIR);
   const eventStore = new EventStore(DATA_DIR);
-  const runManager = new RunManager(bridge, hookServer, eventStore);
+  const runManager = new RunManager(bridge, hookInbox, eventStore);
 
   /** Track which workspaces already have hook configs written. */
   const configuredWorkspaces = new Set<string>();
@@ -90,22 +90,22 @@ export default function register(api: PluginApi) {
   function ensureHookConfig(workspace: string): void {
     if (configuredWorkspaces.has(workspace)) return;
     const hookConfigPath = join(workspace, ".claude", "settings.local.json");
-    hookServer.generateHookConfig(hookConfigPath);
+    hookInbox.writeHookConfig(hookConfigPath);
     configuredWorkspaces.add(workspace);
     api.logger.debug(`[openclaw-cc-bridge] Hook config ensured at ${hookConfigPath}`);
   }
 
-  // --- Background service: Hook Server ---
+  // --- Background service: Hook Inbox ---
   api.registerService({
-    id: "claude-hook-server",
+    id: "claude-hook-inbox",
     start: async () => {
-      const port = await hookServer.start();
-      api.logger.info(`[openclaw-cc-bridge] Hook server started on port ${port}`);
+      hookInbox.start();
+      api.logger.info("[openclaw-cc-bridge] Hook inbox watcher started");
     },
     stop: async () => {
       eventStore.flush();
-      await hookServer.stop();
-      api.logger.info("[openclaw-cc-bridge] Hook server stopped");
+      hookInbox.stop();
+      api.logger.info("[openclaw-cc-bridge] Hook inbox watcher stopped");
     },
   });
 

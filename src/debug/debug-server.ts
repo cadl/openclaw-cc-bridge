@@ -1,7 +1,7 @@
 import * as http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { ClaudeBridge } from "../core/claude-bridge";
-import { HookServer } from "../core/hook-server";
+import { HookInbox } from "../core/hook-inbox";
 import { SessionManager } from "../core/session-manager";
 import { EventStore } from "../core/event-store";
 import { RunManager } from "../core/run-manager";
@@ -16,7 +16,7 @@ const DATA_DIR =
 
 async function main() {
   const sessions = new SessionManager(DATA_DIR);
-  const hookServer = new HookServer();
+  const hookInbox = new HookInbox(DATA_DIR);
   const bridge = new ClaudeBridge({
     maxTimeoutRetries: 2,
     onTimeoutRetry: (attempt, maxRetries, sessionId) => {
@@ -26,16 +26,16 @@ async function main() {
     },
   });
   const eventStore = new EventStore(DATA_DIR);
-  const runManager = new RunManager(bridge, hookServer, eventStore);
+  const runManager = new RunManager(bridge, hookInbox, eventStore);
 
-  // Start hook server
-  const hookPort = await hookServer.start();
-  console.log(`Hook server: http://127.0.0.1:${hookPort}`);
+  // Start hook inbox watcher
+  hookInbox.start();
+  console.log(`Hook inbox: ${DATA_DIR}/hook-inbox/`);
 
   // Write hook config into the project's .claude directory so it only
   // affects Claude Code sessions running inside this workspace.
   const hookConfigPath = join(process.cwd(), ".claude", "settings.local.json");
-  hookServer.generateHookConfig(hookConfigPath);
+  hookInbox.writeHookConfig(hookConfigPath);
   console.log(`Hook config written to ${hookConfigPath}`);
 
   // HTTP server (serves debug page + REST API)
@@ -46,21 +46,34 @@ async function main() {
   // WebSocket server (attached to HTTP server)
   const wss = new WebSocketServer({ server: httpServer });
   const clients = new Set<WebSocket>();
+  const clientStates = new Map<WebSocket, ClientState>();
 
   wss.on("connection", (ws) => {
     clients.add(ws);
+    clientStates.set(ws, { sessionId: undefined, pendingPlan: false });
     broadcast(clients, { type: "status", data: { state: "idle" } });
 
     ws.on("message", (raw) => {
+      let msg: unknown;
       try {
-        const msg = JSON.parse(raw.toString());
-        handleWsMessage(msg, ws, clients, bridge, runManager, hookServer, sessions, eventStore);
+        msg = JSON.parse(raw.toString());
       } catch {
         ws.send(JSON.stringify({ type: "error", data: { message: "Invalid JSON" } }));
+        return;
       }
+      const state = clientStates.get(ws)!;
+      handleWsMessage(msg as any, ws, state, clients, bridge, runManager, hookInbox, sessions, eventStore)
+        .catch((err) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "error", data: { message: String(err) } }));
+          }
+        });
     });
 
-    ws.on("close", () => clients.delete(ws));
+    ws.on("close", () => {
+      clients.delete(ws);
+      clientStates.delete(ws);
+    });
   });
 
   // Start HTTP server
@@ -69,12 +82,14 @@ async function main() {
     console.log("\nReady. Open the URL above in your browser.");
   });
 
-  // Flush event store on shutdown
+  // Clean up on shutdown
   process.on("SIGINT", () => {
+    hookInbox.stop();
     eventStore.flush();
     process.exit(0);
   });
   process.on("SIGTERM", () => {
+    hookInbox.stop();
     eventStore.flush();
     process.exit(0);
   });
@@ -146,36 +161,37 @@ async function main() {
   }
 }
 
-/** Active session ID tracked across messages. */
-let currentSessionId: string | undefined;
-
-/** Whether the current session has a pending plan. */
-let pendingPlan = false;
+/** Per-WebSocket-client state. */
+interface ClientState {
+  sessionId: string | undefined;
+  pendingPlan: boolean;
+}
 
 /** Handle WebSocket messages from the browser. */
 async function handleWsMessage(
   msg: { action: string; prompt?: string; workspace?: string; allowedTools?: string[]; sessionId?: string },
   ws: WebSocket,
+  state: ClientState,
   clients: Set<WebSocket>,
   bridge: ClaudeBridge,
   runManager: RunManager,
-  hookServer: HookServer,
+  hookInbox: HookInbox,
   sessions: SessionManager,
   eventStore: EventStore,
 ) {
   if (msg.action === "reset") {
-    currentSessionId = undefined;
-    pendingPlan = false;
+    state.sessionId = undefined;
+    state.pendingPlan = false;
     return;
   }
 
   if (msg.action === "set-session") {
-    currentSessionId = msg.sessionId || undefined;
-    pendingPlan = false;
-    if (currentSessionId) {
-      const meta = eventStore.getSessionMeta(currentSessionId);
-      const streamEvents = eventStore.readStreamEvents(currentSessionId);
-      const hookEvents = eventStore.readHookEvents(currentSessionId);
+    state.sessionId = msg.sessionId || undefined;
+    state.pendingPlan = false;
+    if (state.sessionId) {
+      const meta = eventStore.getSessionMeta(state.sessionId);
+      const streamEvents = eventStore.readStreamEvents(state.sessionId);
+      const hookEvents = eventStore.readHookEvents(state.sessionId);
 
       // Reconstruct composedMarkdown from stored events
       const composedMarkdown = reconstructComposedMarkdown(
@@ -186,14 +202,14 @@ async function handleWsMessage(
 
       ws.send(JSON.stringify({
         type: "session-history",
-        data: { sessionId: currentSessionId, meta, streamEvents, hookEvents, composedMarkdown },
+        data: { sessionId: state.sessionId, meta, streamEvents, hookEvents, composedMarkdown },
       }));
     }
     return;
   }
 
   if (msg.action === "execute") {
-    if (!pendingPlan || !currentSessionId) {
+    if (!state.pendingPlan || !state.sessionId) {
       ws.send(JSON.stringify({ type: "error", data: { message: "No pending plan to execute" } }));
       return;
     }
@@ -210,20 +226,20 @@ async function handleWsMessage(
       : "Proceed with the plan.";
 
     broadcast(clients, { type: "status", data: { state: "running" } });
-    pendingPlan = false;
+    state.pendingPlan = false;
 
     try {
       const run = await runManager.execute({
         prompt: executePrompt,
         workspace,
-        sessionId: currentSessionId,
+        sessionId: state.sessionId,
         handle: {
           onHookEvent: (type, data) => broadcast(clients, { type: `hook:${type}`, data }),
           onStreamEvent: (type, data) => broadcast(clients, { type, data }),
         },
       });
 
-      currentSessionId = run.response.session_id;
+      state.sessionId = run.response.session_id;
 
       broadcast(clients, {
         type: "result",
@@ -241,7 +257,7 @@ async function handleWsMessage(
       });
     } catch (err) {
       // Restore pending plan on failure so user can retry
-      pendingPlan = true;
+      state.pendingPlan = true;
       const message = err instanceof Error ? err.message : String(err);
       broadcast(clients, { type: "error", data: { message } });
     } finally {
@@ -260,7 +276,7 @@ async function handleWsMessage(
 
     // Sending a new message clears any pending plan
     if (msg.action === "send") {
-      pendingPlan = false;
+      state.pendingPlan = false;
     }
 
     broadcast(clients, { type: "status", data: { state: "running" } });
@@ -270,14 +286,14 @@ async function handleWsMessage(
       let activeRunManager = runManager;
       if (allowedTools && allowedTools.length > 0) {
         const customBridge = new ClaudeBridge({ allowedTools });
-        activeRunManager = new RunManager(customBridge, hookServer, eventStore);
+        activeRunManager = new RunManager(customBridge, hookInbox, eventStore);
       }
 
       const run = await activeRunManager.execute({
         prompt,
         workspace,
-        sessionId: currentSessionId,
-        isNewSession: !currentSessionId,
+        sessionId: state.sessionId,
+        isNewSession: !state.sessionId,
         promptLabel: isPlan ? "[plan]" : undefined,
         permissionMode: isPlan ? "plan" : undefined,
         handle: {
@@ -286,10 +302,10 @@ async function handleWsMessage(
         },
       });
 
-      currentSessionId = run.response.session_id;
+      state.sessionId = run.response.session_id;
 
       if (isPlan) {
-        pendingPlan = true;
+        state.pendingPlan = true;
       }
 
       broadcast(clients, {

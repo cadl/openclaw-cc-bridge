@@ -10,7 +10,7 @@ OpenClaw Chat Platform → OpenClaw API → openclaw-cc-bridge Plugin
   ├── ClaudeBridge    → spawns `claude` CLI as child process (NDJSON streaming)
   ├── SessionManager  → multi-workspace per-sender session persistence
   ├── EventStore      → session stream/hook event logging (store/)
-  ├── HookServer      → local HTTP server on port 19960 for Claude Code webhook callbacks
+  ├── HookInbox       → file-based hook capture with fs.watch (hook-inbox/)
   └── DebugServer     → standalone dev server with WebSocket UI (port 3456)
 ```
 
@@ -28,7 +28,7 @@ src/
 │   ├── run-manager.ts     — Execution orchestrator (coordinates bridge, hooks, events)
 │   ├── session-manager.ts — Multi-workspace sender-to-session mapping persistence
 │   ├── event-store.ts     — Event and stream logging to disk
-│   ├── hook-server.ts     — HTTP hook server for Claude Code callbacks (port 19960)
+│   ├── hook-inbox.ts      — File-based hook capture with fs.watch (replaces HTTP hook server)
 │   └── compose-result.ts  — Markdown result formatting for chat output
 └── debug/
     ├── debug-server.ts    — HTTP API + WebSocket server (port 3456)
@@ -53,7 +53,6 @@ npm run debug    # build + run debug server
 ## Environment Variables
 
 - `OPENCLAW_CC_DATA_DIR` — Data persistence directory (default: `~/.openclaw/openclaw-cc-bridge`)
-- `OPENCLAW_CC_HOOK_PORT` — Hook server port (default: `19960`)
 - `DEBUG_PORT` — Debug UI port (default: `3456`)
 
 ## Conventions
@@ -61,6 +60,6 @@ npm run debug    # build + run debug server
 - All source in `src/`, compiled output in `dist/`
 - Data persisted as JSON/JSONL files under `~/.openclaw/openclaw-cc-bridge/`
 - Claude Code spawned with `--output-format stream-json --verbose` for NDJSON parsing
-- Hook server runs on fixed port 19960 on 127.0.0.1, writes config to `.claude/settings.local.json` in each workspace
+- Hook inbox: Claude Code hooks append to JSONL files in `~/.openclaw/openclaw-cc-bridge/hook-inbox/`, watched by `HookInbox` via fs.watch + polling fallback. Config written to `.claude/settings.local.json` per workspace.
 - Multi-workspace session model: each sender has an active workspace with independent session state (sessionId, pendingPlan, pendingQuestion)
-- RunManager coordinates ClaudeBridge + HookServer + EventStore per execution, with 200ms post-delay for trailing hook events
+- RunManager coordinates ClaudeBridge + HookInbox + EventStore per execution, with 100ms post-delay for trailing hook events

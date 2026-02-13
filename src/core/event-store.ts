@@ -50,6 +50,8 @@ export class EventStore {
   private index = new Map<string, SessionIndexEntry>();
   private streamSeqs = new Map<string, number>();
   private hookSeqs = new Map<string, number>();
+  /** In-memory event counters to avoid read-modify-write on every append. */
+  private metaCounts = new Map<string, { stream: number; hook: number }>();
   private indexDirty = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -65,6 +67,15 @@ export class EventStore {
     const dir = this.sessionDir(sessionId);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
+    }
+
+    // Initialize seq counters from existing JSONL files on first access
+    // to avoid duplicate seq values after process restart.
+    if (!this.streamSeqs.has(sessionId)) {
+      this.streamSeqs.set(sessionId, this.readLastSeq(join(dir, "stream.jsonl")));
+    }
+    if (!this.hookSeqs.has(sessionId)) {
+      this.hookSeqs.set(sessionId, this.readLastSeq(join(dir, "hooks.jsonl")));
     }
 
     const metaPath = join(dir, "meta.json");
@@ -89,8 +100,22 @@ export class EventStore {
         firstPrompt: meta?.firstPrompt,
       });
       this.markIndexDirty();
-    } else if (meta) {
-      this.updateSessionMeta(sessionId, meta);
+    } else {
+      // Initialize in-memory counters from disk on first access
+      if (!this.metaCounts.has(sessionId)) {
+        try {
+          const existing: SessionMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
+          this.metaCounts.set(sessionId, {
+            stream: existing.streamEventCount ?? 0,
+            hook: existing.hookEventCount ?? 0,
+          });
+        } catch {
+          this.metaCounts.set(sessionId, { stream: 0, hook: 0 });
+        }
+      }
+      if (meta) {
+        this.updateSessionMeta(sessionId, meta);
+      }
     }
   }
 
@@ -114,7 +139,7 @@ export class EventStore {
     const filePath = join(this.sessionDir(sessionId), "stream.jsonl");
     appendFileSync(filePath, JSON.stringify(entry) + "\n");
 
-    this.incrementMetaCount(sessionId, "streamEventCount");
+    this.incrementMetaCountInMemory(sessionId, "stream");
     this.touchSession(sessionId);
   }
 
@@ -139,11 +164,11 @@ export class EventStore {
     const filePath = join(this.sessionDir(sessionId), "hooks.jsonl");
     appendFileSync(filePath, JSON.stringify(entry) + "\n");
 
-    this.incrementMetaCount(sessionId, "hookEventCount");
+    this.incrementMetaCountInMemory(sessionId, "hook");
     this.touchSession(sessionId);
   }
 
-  /** Update session metadata fields (merges into existing meta.json). */
+  /** Update session metadata fields (merges into existing meta.json). Also flushes in-memory event counters. */
   updateSessionMeta(sessionId: string, updates: Partial<SessionMeta>): void {
     const metaPath = join(this.sessionDir(sessionId), "meta.json");
     if (!existsSync(metaPath)) return;
@@ -152,6 +177,14 @@ export class EventStore {
       const existing: SessionMeta = JSON.parse(
         readFileSync(metaPath, "utf-8")
       );
+
+      // Merge in-memory event counters
+      const counts = this.metaCounts.get(sessionId);
+      if (counts) {
+        existing.streamEventCount = counts.stream;
+        existing.hookEventCount = counts.hook;
+      }
+
       const merged = { ...existing, ...updates, lastUpdatedAt: Date.now() };
       writeFileSync(metaPath, JSON.stringify(merged, null, 2));
 
@@ -207,7 +240,7 @@ export class EventStore {
     return this.readJsonl(join(this.sessionDir(sessionId), "hooks.jsonl"));
   }
 
-  /** Flush pending index writes. Call on shutdown. */
+  /** Flush pending index writes and in-memory meta counters. Call on shutdown. */
   flush(): void {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -216,6 +249,24 @@ export class EventStore {
     if (this.indexDirty) {
       this.saveIndex();
       this.indexDirty = false;
+    }
+    this.flushMetaCounts();
+  }
+
+  /** Flush in-memory event counters to disk for all tracked sessions. */
+  flushMetaCounts(): void {
+    for (const [sessionId, counts] of this.metaCounts.entries()) {
+      const metaPath = join(this.sessionDir(sessionId), "meta.json");
+      if (!existsSync(metaPath)) continue;
+      try {
+        const meta: SessionMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
+        meta.streamEventCount = counts.stream;
+        meta.hookEventCount = counts.hook;
+        meta.lastUpdatedAt = Date.now();
+        writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+      } catch {
+        // skip corrupted meta
+      }
     }
   }
 
@@ -233,19 +284,31 @@ export class EventStore {
     }
   }
 
-  private incrementMetaCount(
+  /** Increment event count in memory (flushed to disk via flush/flushMetaCounts). */
+  private incrementMetaCountInMemory(
     sessionId: string,
-    field: "streamEventCount" | "hookEventCount"
+    field: "stream" | "hook"
   ): void {
-    const metaPath = join(this.sessionDir(sessionId), "meta.json");
-    if (!existsSync(metaPath)) return;
+    let counts = this.metaCounts.get(sessionId);
+    if (!counts) {
+      counts = { stream: 0, hook: 0 };
+      this.metaCounts.set(sessionId, counts);
+    }
+    counts[field]++;
+  }
+
+  /** Read the last seq number from a JSONL file, or 0 if not available. */
+  private readLastSeq(filePath: string): number {
+    if (!existsSync(filePath)) return 0;
     try {
-      const meta: SessionMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
-      meta[field] = (meta[field] ?? 0) + 1;
-      meta.lastUpdatedAt = Date.now();
-      writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+      const content = readFileSync(filePath, "utf-8");
+      const lines = content.trimEnd().split("\n");
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) return 0;
+      const entry = JSON.parse(lastLine) as PersistedEvent;
+      return entry.seq ?? 0;
     } catch {
-      // skip
+      return 0;
     }
   }
 

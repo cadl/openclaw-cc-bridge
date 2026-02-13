@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import type { PendingQuestion } from "./claude-bridge";
 
@@ -250,6 +250,9 @@ export class SessionManager {
     for (const [senderId, state] of this.senderStates.entries()) {
       data[senderId] = state;
     }
-    writeFileSync(this.persistPath, JSON.stringify(data, null, 2));
+    // Atomic write: write to temp file then rename to avoid partial writes on crash
+    const tmpPath = this.persistPath + ".tmp";
+    writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+    renameSync(tmpPath, this.persistPath);
   }
 }
