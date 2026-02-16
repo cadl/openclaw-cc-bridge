@@ -96,6 +96,14 @@ Example config:
 | `OPENCLAW_CC_DATA_DIR` | `~/.openclaw/openclaw-cc-bridge` | Directory for session and event data |
 | `DEBUG_PORT` | `3456` | Port for the debug UI server |
 
+## Recommended Configuration
+
+For the best experience, especially if you communicate in non-English languages, add the configuration snippets from [`SOUL_CONFIGURATION.md`](./SOUL_CONFIGURATION.md) to your OpenClaw workspace `SOUL.md` file.
+
+This ensures:
+- Your original language is preserved when sending prompts to Claude Code
+- You receive complete, unmodified output from Claude Code sessions
+
 ## Architecture
 
 ```
