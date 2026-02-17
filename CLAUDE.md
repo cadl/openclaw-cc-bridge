@@ -18,7 +18,7 @@ OpenClaw Chat Platform → OpenClaw API → openclaw-cc-bridge Plugin
 
 ```
 skills/
-└── claude-code/           — OpenClaw skill (AI agent auto-discovery)
+└── cc-bridge/             — OpenClaw skill (AI agent auto-discovery)
     └── SKILL.md           — Skill definition with gating (requires claude CLI)
 src/
 ├── plugin/
@@ -85,4 +85,5 @@ Example config:
 - Claude Code spawned with `--output-format stream-json --verbose` for NDJSON parsing
 - Hook inbox: All Claude Code hooks append to a single `events.jsonl` file in `~/.openclaw/openclaw-cc-bridge/hook-inbox/`, watched by `HookInbox` via fs.watch + polling fallback. Event type is determined from the `hook_event_name` field in each payload. Config written to `.claude/settings.local.json` per workspace.
 - Multi-workspace session model: each sender has an active workspace with independent session state (sessionId, pendingPlan, pendingQuestion)
+- Session defaults are asymmetric: slash commands default to **resume**, agent tools default to **fresh**. Slash commands support `--new`/`-n` to force fresh; agent tools support `continue_session: true` to resume.
 - RunManager coordinates ClaudeBridge + HookInbox + EventStore per execution, with 100ms post-delay for trailing hook events

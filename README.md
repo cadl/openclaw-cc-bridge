@@ -21,12 +21,18 @@ openclaw-cc-bridge bridges OpenClaw chat commands with Claude Code CLI, enabling
 
 | Command | Description |
 |---------|-------------|
-| `/cc [-w <path>] <message>` | Send a prompt to Claude Code and receive the response |
-| `/cc_plan [-w <path>] <message>` | Create a read-only plan (uses `--permission-mode plan`) |
-| `/cc_execute [-w <path>] [notes]` | Execute a pending plan (optional additional notes) |
+| `/cc [-m <model>] [-w <path>] [-n] <message>` | Send a prompt to Claude Code (resumes previous session by default) |
+| `/cc_plan [-m <model>] [-w <path>] [-n] <message>` | Create a read-only plan (uses `--permission-mode plan`) |
+| `/cc_execute [-m <model>] [-w <path>] [notes]` | Execute a pending plan (optional additional notes) |
 | `/cc_workspace [path]` | Set the active workspace, or list all workspace sessions |
 | `/cc_reset [-w <path> \| --all]` | Reset session for active/specific/all workspaces |
 | `/cc_status [-w <path>]` | Show session info (ID, workspace, message count, pending state) |
+
+**Flags:**
+
+- `-m <model>` / `--model <model>` — Override model for this invocation (`sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`)
+- `-w <path>` / `--workspace <path>` — Target a specific workspace
+- `-n` / `--new` — Force a new Claude Code session instead of resuming
 
 ## Agent Tools
 
@@ -34,14 +40,32 @@ The plugin registers LLM-callable tools via `registerTool`, allowing AI agents t
 
 | Tool | Description |
 |------|-------------|
-| `cc_send` | Send a message to Claude Code for processing |
-| `cc_plan` | Create a read-only implementation plan |
-| `cc_execute` | Execute a previously created plan |
+| `cc_send` | Send a message to Claude Code (fresh session by default; set `continue_session: true` to resume) |
+| `cc_plan` | Create a read-only implementation plan (fresh session by default) |
+| `cc_execute` | Execute a previously created plan (always resumes the plan session) |
 | `cc_workspace` | Set or list workspace directories |
 | `cc_reset` | Reset session(s) |
 | `cc_status` | Show session status |
 
-All tools accept an optional `workspace` parameter. If omitted, they use the active workspace for the agent sender.
+All tools accept optional `workspace` and `model` parameters.
+
+## Session Management
+
+Slash commands and agent tools use **asymmetric defaults** to align Claude Code sessions with OpenClaw conversation boundaries:
+
+| Path | Default | Override |
+|------|---------|----------|
+| Slash commands (`/cc`, `/cc_plan`) | **Resume** previous session | `--new` / `-n` to force fresh |
+| Agent tools (`cc_send`, `cc_plan`) | **Fresh** session | `continue_session: true` to resume |
+
+This asymmetry works because:
+
+- **Slash commands** are typed by the user within a continuous conversation — resuming is the natural default, with `--new` for explicit resets.
+- **Agent tools** are called by the LLM. After OpenClaw's `/new` command, the LLM loses all prior context and won't set `continue_session: true`, so a fresh Claude Code session starts automatically.
+
+Special cases:
+- If Claude Code asked a question (`pendingQuestion`), the next call **always resumes** regardless of flags.
+- `cc_execute` always resumes the plan session.
 
 ## Skills
 
@@ -72,6 +96,7 @@ Register the plugin in your OpenClaw setup. The plugin reads from `openclaw.plug
 
 | Key | Type | Description |
 |-----|------|-------------|
+| `model` | `string` | Default Claude model (`sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`). Can be overridden per-invocation via `-m` flag or tool `model` parameter. If omitted, uses Claude CLI default. |
 | `env` | `Record<string, string>` | Environment variables passed to the Claude Code process. The plugin strips all `ANTHROPIC_*` and `CLAUDE_*` vars from the parent process env to prevent leakage, then merges these values in. Use this to set `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, etc. |
 | `allowedTools` | `string[]` | Claude Code tool names to allow (e.g. `["Bash", "Read", "Write"]`). If omitted, defaults to `["Read", "Edit", "Write", "Bash", "Glob", "Grep"]`. |
 
@@ -79,6 +104,7 @@ Example config:
 
 ```json
 {
+  "model": "sonnet",
   "env": {
     "ANTHROPIC_BASE_URL": "https://your-api-relay.example.com",
     "ANTHROPIC_API_KEY": "sk-..."
