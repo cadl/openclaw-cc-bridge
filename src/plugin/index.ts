@@ -97,6 +97,19 @@ function parseModelArg(args: string): { model: string | undefined; rest: string 
   return { model: undefined, rest: args };
 }
 
+/**
+ * Parse --new / -n flag from command args.
+ * Returns whether the user wants to force a new Claude Code session.
+ */
+function parseNewSessionFlag(args: string): { forceNew: boolean; rest: string } {
+  const flagMatch = args.match(/(?:^|\s)(?:--new|-n)(?:\s|$)/);
+  if (flagMatch) {
+    const rest = args.replace(flagMatch[0], " ").trim();
+    return { forceNew: true, rest };
+  }
+  return { forceNew: false, rest: args };
+}
+
 /** Helper: wrap text in a ToolResult. */
 function textResult(text: string): ToolResult {
   return { content: [{ type: "text", text }] };
@@ -151,31 +164,54 @@ export default function register(api: PluginApi) {
     api.logger.debug(`[openclaw-cc-bridge] Hook config ensured at ${hookConfigPath}`);
   }
 
+  /** Log run completion stats. */
+  function logRunCompleted(label: string, workspace: string, run: import("../core/run-manager").RunResult): void {
+    const r = run.response;
+    const cost = r.cost_usd != null ? `$${r.cost_usd.toFixed(4)}` : "?";
+    const duration = r.duration_ms != null ? `${(r.duration_ms / 1000).toFixed(1)}s` : "?";
+    api.logger.info(
+      `[openclaw-cc-bridge] ${label}[${workspace}] completed: session=${r.session_id} turns=${r.num_turns ?? "?"} cost=${cost} duration=${duration}`
+    );
+  }
+
   // =====================================================================
   // Shared logic: used by both command handlers and agent tools
   // =====================================================================
 
-  async function doSend(senderId: string, workspace: string, prompt: string, model?: string): Promise<string> {
+  async function doSend(senderId: string, workspace: string, prompt: string, model?: string, forceNew?: boolean): Promise<string> {
     if (!existsSync(workspace)) {
       return `Workspace does not exist: ${workspace}`;
     }
 
     const wsSession = sessions.getSession(senderId, workspace);
-    const existingSession = wsSession?.claudeSessionId;
+    const existingSessionId = wsSession?.claudeSessionId;
 
     if (sessions.hasPendingPlan(senderId, workspace)) {
       sessions.setPendingPlan(senderId, workspace, false);
     }
 
+    // Determine whether to resume an existing session
+    // Default: resume if available. forceNew overrides to fresh.
     let effectivePrompt = prompt;
+    let sessionId: string | undefined;
+
     const pq = sessions.getPendingQuestion(senderId, workspace);
     if (pq) {
+      // pendingQuestion: must resume to answer Claude's question (overrides forceNew)
+      sessionId = existingSessionId;
       effectivePrompt = `The user responded to your previous question with: "${prompt}"\nPlease continue based on their choice.`;
       sessions.setPendingQuestion(senderId, workspace, undefined);
+    } else if (forceNew) {
+      // Explicit new session request
+      sessionId = undefined;
+    } else {
+      // Default: resume existing session if available
+      sessionId = existingSessionId;
     }
 
     api.logger.info(
-      `[openclaw-cc-bridge] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}`
+      `[openclaw-cc-bridge] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}` +
+      (sessionId ? ` (resuming ${sessionId})` : " (new session)")
     );
 
     ensureHookConfig(workspace);
@@ -183,22 +219,24 @@ export default function register(api: PluginApi) {
     const run = await runManager.execute({
       prompt: effectivePrompt,
       workspace,
-      sessionId: existingSession,
-      isNewSession: !existingSession,
+      sessionId,
+      isNewSession: !sessionId,
       model,
     });
 
     sessions.updateSession(senderId, workspace, run.response.session_id);
     sessions.setActiveWorkspace(senderId, workspace);
+    logRunCompleted("", workspace, run);
 
     if (run.response.pendingQuestion) {
       sessions.setPendingQuestion(senderId, workspace, run.response.pendingQuestion);
+      api.logger.info(`[openclaw-cc-bridge] [${workspace}] Claude asked a question, awaiting reply`);
     }
 
     return run.composedMarkdown;
   }
 
-  async function doPlan(senderId: string, workspace: string, prompt: string, model?: string): Promise<string> {
+  async function doPlan(senderId: string, workspace: string, prompt: string, model?: string, forceNew?: boolean): Promise<string> {
     if (!existsSync(workspace)) {
       return `Workspace does not exist: ${workspace}`;
     }
@@ -211,10 +249,14 @@ export default function register(api: PluginApi) {
     }
 
     const wsSession = sessions.getSession(senderId, workspace);
-    const existingSession = wsSession?.claudeSessionId;
+    const existingSessionId = wsSession?.claudeSessionId;
+
+    // Default: resume existing session. forceNew overrides to fresh.
+    const sessionId = forceNew ? undefined : existingSessionId;
 
     api.logger.info(
-      `[openclaw-cc-bridge] [plan] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}`
+      `[openclaw-cc-bridge] [plan] [${workspace}] "${prompt.slice(0, 50)}..." from ${senderId}` +
+      (sessionId ? ` (resuming ${sessionId})` : " (new session)")
     );
 
     ensureHookConfig(workspace);
@@ -222,8 +264,8 @@ export default function register(api: PluginApi) {
     const run = await runManager.execute({
       prompt,
       workspace,
-      sessionId: existingSession,
-      isNewSession: !existingSession,
+      sessionId,
+      isNewSession: !sessionId,
       promptLabel: "[plan]",
       permissionMode: "plan",
       model,
@@ -232,6 +274,7 @@ export default function register(api: PluginApi) {
     sessions.updateSession(senderId, workspace, run.response.session_id);
     sessions.setActiveWorkspace(senderId, workspace);
     sessions.setPendingPlan(senderId, workspace, true);
+    logRunCompleted("[plan] ", workspace, run);
 
     let text = run.composedMarkdown;
     text += "\n\n---";
@@ -274,6 +317,7 @@ export default function register(api: PluginApi) {
       });
 
       sessions.updateSession(senderId, workspace, run.response.session_id);
+      logRunCompleted("[execute] ", workspace, run);
 
       return run.composedMarkdown;
     } catch (err) {
@@ -328,9 +372,11 @@ export default function register(api: PluginApi) {
   function doReset(senderId: string, workspace?: string, all?: boolean): string {
     if (all) {
       const count = sessions.removeAllSessions(senderId);
-      return count > 0
-        ? `Reset ${count} workspace session(s). Next message starts fresh.`
-        : "No active sessions to reset.";
+      if (count > 0) {
+        api.logger.info(`[openclaw-cc-bridge] Reset all ${count} session(s) for ${senderId}`);
+        return `Reset ${count} workspace session(s). Next message starts fresh.`;
+      }
+      return "No active sessions to reset.";
     }
 
     const targetWs = workspace ? resolve(workspace) : sessions.getActiveWorkspace(senderId);
@@ -339,9 +385,11 @@ export default function register(api: PluginApi) {
     }
 
     const removed = sessions.removeSession(senderId, targetWs);
-    return removed
-      ? `Session reset for workspace: ${targetWs}\nNext message starts a new conversation.`
-      : `No active session for workspace: ${targetWs}`;
+    if (removed) {
+      api.logger.info(`[openclaw-cc-bridge] Session reset for ${targetWs} (sender: ${senderId})`);
+      return `Session reset for workspace: ${targetWs}\nNext message starts a new conversation.`;
+    }
+    return `No active session for workspace: ${targetWs}`;
   }
 
   function doStatus(senderId: string, workspace?: string): string {
@@ -423,18 +471,22 @@ export default function register(api: PluginApi) {
     requireAuth: true,
     handler: async (ctx) => {
       const { model, rest: argsAfterModel } = parseModelArg(ctx.args.trim());
-      const { workspace, rest: prompt } = parseWorkspaceArg(
+      const { workspace, rest: argsAfterWorkspace } = parseWorkspaceArg(
         argsAfterModel,
         sessions.getActiveWorkspace(ctx.senderId)
       );
+      const { forceNew, rest: prompt } = parseNewSessionFlag(argsAfterWorkspace);
 
       if (!prompt) {
         return {
           text: [
-            "Usage: /cc [-m <model>] [-w <workspace>] <your message>",
+            "Usage: /cc [-m <model>] [-w <workspace>] [-n | --new] <your message>",
             "Example: /cc fix the bug in auth.py",
-            "Example: /cc -m opus -w /path/to/project fix the bug",
+            "Example: /cc --new start a completely new task",
             `Models: ${VALID_MODELS.join(", ")}`,
+            "",
+            "Session: resumes previous session by default.",
+            "  Use -n/--new to start a fresh session.",
             "",
             "Other commands:",
             "  /cc_plan <message>    — create a plan first (read-only)",
@@ -451,7 +503,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return { text: await doSend(ctx.senderId, workspace, prompt, model) };
+        return { text: await doSend(ctx.senderId, workspace, prompt, model, forceNew) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] Error: ${msg}`);
@@ -468,18 +520,22 @@ export default function register(api: PluginApi) {
     requireAuth: true,
     handler: async (ctx) => {
       const { model, rest: argsAfterModel } = parseModelArg(ctx.args.trim());
-      const { workspace, rest: prompt } = parseWorkspaceArg(
+      const { workspace, rest: argsAfterWorkspace } = parseWorkspaceArg(
         argsAfterModel,
         sessions.getActiveWorkspace(ctx.senderId)
       );
+      const { forceNew, rest: prompt } = parseNewSessionFlag(argsAfterWorkspace);
 
       if (!prompt) {
         return {
           text: [
-            "Usage: /cc_plan [-m <model>] [-w <workspace>] <your task description>",
+            "Usage: /cc_plan [-m <model>] [-w <workspace>] [-n | --new] <your task description>",
             "Example: /cc_plan refactor the authentication module",
-            "Example: /cc_plan -m opus refactor the authentication module",
+            "Example: /cc_plan --new plan a different approach",
             `Models: ${VALID_MODELS.join(", ")}`,
+            "",
+            "Session: resumes previous session by default.",
+            "  Use -n/--new to start a fresh session.",
             "",
             "Claude will analyze the codebase and produce an implementation plan",
             "without making any changes. Review the plan, then:",
@@ -495,7 +551,7 @@ export default function register(api: PluginApi) {
       }
 
       try {
-        return { text: await doPlan(ctx.senderId, workspace, prompt, model) };
+        return { text: await doPlan(ctx.senderId, workspace, prompt, model, forceNew) };
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [plan] Error: ${msg}`);
@@ -591,29 +647,38 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_send",
-    description: "Send a message to Claude Code for processing. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase. Present the full result to the user exactly as returned — do not summarize or rephrase.",
+    description: "Send a message to Claude Code for processing. Each call starts a fresh session by default. Set continue_session=true to resume the previous session. Use this to write, edit, fix, refactor code, run commands, or ask questions about a codebase. Present the full result to the user exactly as returned — do not summarize or rephrase.",
     parameters: {
       type: "object",
       properties: {
         message: { type: "string", description: "The task or message for Claude Code" },
         workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
         model: { type: "string", enum: VALID_MODELS, description: modelEnumDescription },
+        continue_session: { type: "boolean", description: "If true, resume the previous Claude Code session instead of starting a new one. Default: false." },
       },
       required: ["message"],
     },
     async execute(_id, params) {
       const message = params.message as string;
       const model = params.model as string | undefined;
+      const continueSession = params.continue_session as boolean | undefined;
+      // Agent tools: default fresh, continue_session=true to resume
+      const forceNew = !continueSession;
       const workspace = (params.workspace as string | undefined)
         ? resolve(params.workspace as string)
         : sessions.getActiveWorkspace(AGENT_SENDER_ID);
+
+      api.logger.info(
+        `[openclaw-cc-bridge] [tool:cc_send] "${message.slice(0, 50)}..." workspace=${workspace ?? "(none)"}` +
+        ` continue_session=${!!continueSession} model=${model ?? "default"}`
+      );
 
       if (!workspace) {
         return textResult("No active workspace. Use cc_workspace tool to set one first.");
       }
 
       try {
-        return textResult(await doSend(AGENT_SENDER_ID, workspace, message, model));
+        return textResult(await doSend(AGENT_SENDER_ID, workspace, message, model, forceNew));
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_send] Error: ${msg}`);
@@ -624,29 +689,38 @@ export default function register(api: PluginApi) {
 
   api.registerTool({
     name: "cc_plan",
-    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Use for complex or high-risk changes where you want to review before executing. Present the full result to the user exactly as returned — do not summarize or rephrase.",
+    description: "Ask Claude Code to analyze the codebase and create an implementation plan without making any changes (read-only). Each call starts a fresh session by default. Set continue_session=true to resume the previous session in this conversation. Use for complex or high-risk changes where you want to review before executing. Present the full result to the user exactly as returned — do not summarize or rephrase.",
     parameters: {
       type: "object",
       properties: {
         message: { type: "string", description: "The task description to plan for" },
         workspace: { type: "string", description: "Workspace directory path. If omitted, uses the active workspace." },
         model: { type: "string", enum: VALID_MODELS, description: modelEnumDescription },
+        continue_session: { type: "boolean", description: "If true, resume the previous Claude Code session instead of starting a new one. Default: false." },
       },
       required: ["message"],
     },
     async execute(_id, params) {
       const message = params.message as string;
       const model = params.model as string | undefined;
+      const continueSession = params.continue_session as boolean | undefined;
+      // Agent tools: default fresh, continue_session=true to resume
+      const forceNew = !continueSession;
       const workspace = (params.workspace as string | undefined)
         ? resolve(params.workspace as string)
         : sessions.getActiveWorkspace(AGENT_SENDER_ID);
+
+      api.logger.info(
+        `[openclaw-cc-bridge] [tool:cc_plan] "${message.slice(0, 50)}..." workspace=${workspace ?? "(none)"}` +
+        ` continue_session=${!!continueSession} model=${model ?? "default"}`
+      );
 
       if (!workspace) {
         return textResult("No active workspace. Use cc_workspace tool to set one first.");
       }
 
       try {
-        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message, model));
+        return textResult(await doPlan(AGENT_SENDER_ID, workspace, message, model, forceNew));
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
         api.logger.error(`[openclaw-cc-bridge] [tool:cc_plan] Error: ${msg}`);

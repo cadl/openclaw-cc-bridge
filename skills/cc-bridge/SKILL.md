@@ -21,23 +21,25 @@ The following tools are available for direct invocation:
 
 ### cc_send
 
-Send a message to Claude Code for immediate processing.
+Send a message to Claude Code for immediate processing. Each call starts a fresh session by default.
 
 Parameters:
 - `message` (string, required) — The task or message for Claude Code
 - `workspace` (string, optional) — Workspace directory path. If omitted, uses the active workspace.
 - `model` (string, optional) — Model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. If omitted, uses configured default.
+- `continue_session` (boolean, optional) — If true, resume the previous session instead of starting fresh. Default: false.
 
 Use for: writing code, fixing bugs, refactoring, running commands, asking questions about a codebase.
 
 ### cc_plan
 
-Create a read-only implementation plan without making any changes.
+Create a read-only implementation plan without making any changes. Each call starts a fresh session by default.
 
 Parameters:
 - `message` (string, required) — The task description to plan for
 - `workspace` (string, optional) — Workspace directory path. If omitted, uses the active workspace.
 - `model` (string, optional) — Model to use. Options: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`. If omitted, uses configured default.
+- `continue_session` (boolean, optional) — If true, resume the previous session instead of starting fresh. Default: false.
 
 Use for: complex or high-risk changes where you want to review before executing. After creating a plan, use `cc_execute` to proceed or `cc_reset` to discard.
 
@@ -79,19 +81,27 @@ Parameters:
 ## Typical workflow
 
 1. Set a workspace: `cc_workspace({ path: "/path/to/project" })`
-2. For simple tasks: `cc_send({ message: "fix the auth bug in login.ts" })`
-3. For complex tasks:
+2. First task: `cc_send({ message: "fix the auth bug in login.ts" })`
+3. Follow-up in same conversation: `cc_send({ message: "also add tests for the fix", continue_session: true })`
+4. For complex tasks:
    - `cc_plan({ message: "refactor the authentication module" })`
    - Review the plan output
    - `cc_execute()` or `cc_execute({ notes: "also update the tests" })`
-4. Follow-up messages continue the same session with full prior context.
+
+## Session management
+
+**IMPORTANT**: Each `cc_send` / `cc_plan` call starts a **fresh** Claude Code session by default. You MUST set `continue_session: true` when following up on previous cc tool results in the same conversation.
+
+- **First cc call in conversation** → omit `continue_session` (fresh session)
+- **Follow-up cc call** (you have prior `cc_send`/`cc_plan` results in this conversation) → set `continue_session: true`
+- **New unrelated task** (user explicitly wants to start fresh) → omit `continue_session`
+
+If Claude Code asked a question (pendingQuestion), the next `cc_send` automatically resumes the session to answer it — no need to set `continue_session`.
 
 ## Behavior notes
 
-- Each session is persistent per workspace. Follow-up calls continue the conversation.
-- If Claude Code asks a question, respond with `cc_send({ message: "your answer" })`.
+- Plan-then-execute workflow always resumes: `cc_execute` inherently continues the plan session.
 - Using `cc_send` while a plan is pending discards the plan and processes the message directly.
-- Use `cc_reset` when context seems stale or Claude Code is confused by prior conversation.
 - Model can be specified per-invocation or as a global default in plugin config. Per-invocation overrides the default. Available models: `sonnet`, `opus`, `haiku`, `sonnet[1m]`, `opusplan`.
 
 ## Output handling
