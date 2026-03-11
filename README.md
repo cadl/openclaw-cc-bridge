@@ -84,8 +84,13 @@ When the skill is loaded, users can simply describe what they want in natural la
 ### Install
 
 ```bash
-npm install
-npm run build
+openclaw plugin add openclaw-cc-bridge
+```
+
+Or install manually via npm:
+
+```bash
+npm install openclaw-cc-bridge
 ```
 
 ### Configuration
